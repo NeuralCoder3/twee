@@ -1,0 +1,1 @@
+./dist-newstyle/build/x86_64-linux/ghc-9.6.6/twee-2.5/x/twee/build/twee/twee $@

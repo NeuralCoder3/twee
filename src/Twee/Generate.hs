@@ -8,6 +8,20 @@ import Data.Maybe
 import Twee.Profile
 import Twee.Utils
 import Debug.Trace
+import Control.Monad (when)
+import System.IO.Unsafe (unsafePerformIO)
+
+-- Set this to True to enable debug output
+debug :: Bool
+debug = True
+
+-- Simple debug function that works in any monad
+debugPrint :: String -> a -> a
+debugPrint msg x = if debug then unsafePerformIO (putStrLn msg >> return x) else x
+
+-- Debug function that works in the Gen monad
+debugPrintM :: String -> Gen ()
+debugPrintM msg = if debug then return (unsafePerformIO (putStrLn msg)) else return ()
 
 type Pat f = Term f
 type LHS f = Term f
@@ -63,14 +77,14 @@ genList n lhss (p:ps) sub =
 generateGoalTerm :: Function f => [Term f] -> [Rule f] -> Gen (Term f, Reduction1 f)
 generateGoalTerm goals rules = stampGen "generateGoalTerm" $ sized $ \n -> do
   t <- frequency [(len u, return u) | u <- goals]
-  -- () <- traceM ("Goal term: " ++ prettyShow t)
+  debugPrintM ("Goal term: " ++ prettyShow t)
   let ok u = len u <= n
   (u, r) <- loop (n `div` 5 + 1) (rewriteBackwardsWithReduction ok rules) (t, [])
-  -- () <- traceM ("intermediate generated " ++ prettyShow u)
+  debugPrintM ("intermediate generated " ++ prettyShow u)
   -- fill in any holes with randomly-generated terms
   v <- generateTerm' (map lhs rules) u
-  -- () <- traceM ("generated " ++ prettyShow v)
-  -- () <- traceM ("proof " ++ prettyShow r)
+  debugPrintM ("generated " ++ prettyShow v)
+  debugPrintM ("proof " ++ prettyShow r)
   return (v, rematchReduction1 v r)
 
 loop :: Monad m => Int -> (a -> m a) -> a -> m a

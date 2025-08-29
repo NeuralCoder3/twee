@@ -2,6 +2,7 @@
 {-# LANGUAGE RecordWildCards, MultiParamTypeClasses, GADTs, BangPatterns, OverloadedStrings, ScopedTypeVariables, GeneralizedNewtypeDeriving, PatternGuards, TypeFamilies, FlexibleInstances, RankNTypes, TupleSections #-}
 module Twee where
 
+import System.IO.Unsafe (unsafePerformIO)
 import Twee.Base
 import Twee.Rule hiding (normalForms)
 import qualified Twee.Rule as Rule
@@ -30,6 +31,7 @@ import qualified Data.Map.Strict as Map
 import Data.Map(Map)
 import Data.Int
 import Control.Monad
+import Data.Char (isDigit)
 import Control.Monad.IO.Class
 import Control.Monad.Trans.Class
 import qualified Control.Monad.Trans.State.Strict as StateM
@@ -105,7 +107,7 @@ defaultConfig =
     cfg_renormalise_threshold = 20,
     cfg_cp_sample_size = 100,
     cfg_set_join_goals = True,
-    cfg_always_simplify = False,
+    cfg_always_simplify = True,
     cfg_complete_subsets = False,
     cfg_score_cp = \d eqn -> fromIntegral (score CP.defaultConfig d eqn),
     cfg_join = Join.defaultConfig,
@@ -935,7 +937,94 @@ goalTerms state =
 
 {-# INLINEABLE solved #-}
 solved :: Function f => State f -> Bool
-solved = not . null . solutions
+solved state =
+  let
+    fmtGoal Goal{..} =
+      let
+        lhs0 = case goal_eqn of { t :=: _ -> t }
+        rhs0 = case goal_eqn of { _ :=: u -> u }
+        lhsS = simplifyTerm state lhs0
+        rhsS = simplifyTerm state rhs0
+        -- list all original terms that simplify to a given normal form
+        preimages :: Term f -> Map (Term f) (Term f, Reduction f) -> [(Term f, Reduction f)]
+        preimages nf m =
+          [ (t, r)
+          | (t, (u, r)) <- Map.toList m
+          , u == nf
+          ]
+        -- also re-simplify sources to avoid mismatch with stored maps
+        preimagesResimpl nf m =
+          [ t
+          | (t, _) <- Map.toList m
+          , simplifyTerm state t == nf
+          ]
+        showOrigins nf =
+          let fromL = preimages nf goal_lhs
+              fromR = preimages nf goal_rhs
+              fromL2 = preimagesResimpl nf goal_lhs
+              fromR2 = preimagesResimpl nf goal_rhs
+              showOne (orig, _r) = "      - " ++ prettyShow orig
+              showOneT t = "      - " ++ prettyShow t ++ " (resimplified)"
+              linesL = if null fromL && null fromL2 then [] else ("    origins from lhs:" : (map showOne fromL ++ map showOneT fromL2))
+              linesR = if null fromR && null fromR2 then [] else ("    origins from rhs:" : (map showOne fromR ++ map showOneT fromR2))
+          in if null linesL && null linesR then "" else ("\n" ++ unlines (linesL ++ linesR))
+        isConst t = case t of { App _ xs -> null (unpack xs); _ -> False }
+        -- show defining rules for a constant head symbol (e.g., *3)
+        showDefs nf =
+          case nf of
+            App f _ ->
+              let sameHead t = case t of { App g _ -> fun_id g == fun_id f; _ -> False }
+                  rulesAll = Index.elems (index_all (st_rules state))
+                  defs = [ r | r <- rulesAll, sameHead (lhs r) ]
+                  one r = "      - " ++ prettyShow (unorient r)
+              in if null defs then "" else ("\n    definitions:" ++ "\n" ++ unlines (map one defs))
+            _ -> ""
+        -- show rules that produce this constant as RHS exactly
+        showProducers nf =
+          let rulesAll = Index.elems (index_all (st_rules state))
+              pros = [ r | r <- rulesAll, rhs r == nf ]
+              one r = "      - " ++ prettyShow (unorient r)
+              -- terms without numbered symbols
+              funHasDigits f = any isDigit (prettyShow f)
+              termHasDigits t = any funHasDigits (collect t)
+              plainTerms = [ lhs r | r <- pros, not (termHasDigits (lhs r)) ]
+              plainSorted = sortOn len plainTerms
+              onePlain t = "      - " ++ prettyShow t ++ "  (size=" ++ show (len t) ++ ")"
+              sectionPlain = if null plainTerms then "" else ("\n    produced (no numbered symbols), by size:" ++ "\n" ++ unlines (map onePlain plainSorted))
+          in if null pros then "" else ("\n    produced by rules:" ++ "\n" ++ unlines (map one pros) ++ sectionPlain)
+        -- show joinable equations mentioning the constant
+        showJoinable nf =
+          let js = [ e | e@(t :=: u) <- Index.elems (st_joinable state), t == nf || u == nf ]
+              one (t :=: u) = "      - " ++ prettyShow t ++ " = " ++ prettyShow u
+          in if null js then "" else ("\n    joinable equations:" ++ "\n" ++ unlines (map one js))
+        extraL = if isConst lhsS then showOrigins lhsS ++ showDefs lhsS ++ showProducers lhsS ++ showJoinable lhsS else ""
+        extraR = if isConst rhsS then showOrigins rhsS ++ showDefs rhsS ++ showProducers rhsS ++ showJoinable rhsS else ""
+        -- collect all function symbols used in these terms
+        collect :: Term f -> [Fun f]
+        collect (Var _) = []
+        collect (App f xs) = f : concatMap collect (unpack xs)
+        funs = usort (collect lhs0 ++ collect rhs0 ++ collect lhsS ++ collect rhsS)
+        describe f =
+          let nameShown = prettyShow f
+              ident     = show (fun_id f)
+              occArity t = case t of { App g ys | theSame g -> Just (length (unpack ys)); _ -> Nothing }
+              theSame g = fun_id g == fun_id f
+              arities = mapMaybe occArity (subterms lhs0 ++ subterms rhs0 ++ subterms lhsS ++ subterms rhsS)
+              arityStr = case usort arities of { [] -> "?"; [n] -> show n; ns -> show ns }
+          in "  - " ++ nameShown ++ "  (id=" ++ ident ++ ", arity=" ++ arityStr ++ ")"
+        symTable = if null funs then "" else "\n  Symbols used:\n" ++ unlines (map describe funs)
+      in "goal " ++ show goal_number ++ " (" ++ goal_name ++ "):\n  lhs: " ++ prettyShow lhs0 ++ " -> " ++ prettyShow lhsS ++ extraL ++
+         "\n  rhs: " ++ prettyShow rhs0 ++ " -> " ++ prettyShow rhsS ++ extraR ++ symTable
+    -- Optional: try to show a decoded/presented goal if we have any solutions so far
+    decoded =
+      case solutions state of
+        [] -> ""
+        sol -> "\nDecoded/presented view (if any solution exists):\n" ++ prettyShow (Proof.present Proof.defaultConfig sol) ++ "\n"
+    msg =
+      case st_goals state of
+        [] -> "No goals."
+        gs -> unlines (map fmtGoal gs) ++ decoded
+  in unsafePerformIO (putStrLn msg) `seq` (not (null (solutions state)))
 
 -- Return whatever goals we have proved and their proofs.
 {-# INLINEABLE solutions #-}
