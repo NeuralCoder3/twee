@@ -2,7 +2,6 @@
 {-# LANGUAGE RecordWildCards, MultiParamTypeClasses, GADTs, BangPatterns, OverloadedStrings, ScopedTypeVariables, GeneralizedNewtypeDeriving, PatternGuards, TypeFamilies, FlexibleInstances, RankNTypes, TupleSections #-}
 module Twee where
 
-import System.IO.Unsafe (unsafePerformIO)
 import Twee.Base
 import Twee.Rule hiding (normalForms)
 import qualified Twee.Rule as Rule
@@ -31,7 +30,6 @@ import qualified Data.Map.Strict as Map
 import Data.Map(Map)
 import Data.Int
 import Control.Monad
-import Data.Char (isDigit)
 import Control.Monad.IO.Class
 import Control.Monad.Trans.Class
 import qualified Control.Monad.Trans.State.Strict as StateM
@@ -46,6 +44,8 @@ import Test.QuickCheck.Random
 import Debug.Trace
 import Twee.Generate
 import qualified System.Random as Random
+import System.IO.Unsafe (unsafePerformIO)
+import Data.Char (isDigit)
 
 ----------------------------------------------------------------------
 -- * Configuration and prover state.
@@ -107,7 +107,7 @@ defaultConfig =
     cfg_renormalise_threshold = 20,
     cfg_cp_sample_size = 100,
     cfg_set_join_goals = True,
-    cfg_always_simplify = True,
+    cfg_always_simplify = False,
     cfg_complete_subsets = False,
     cfg_score_cp = \d eqn -> fromIntegral (score CP.defaultConfig d eqn),
     cfg_join = Join.defaultConfig,
@@ -937,6 +937,7 @@ goalTerms state =
 
 {-# INLINEABLE solved #-}
 solved :: Function f => State f -> Bool
+-- solved = not . null . solutions
 solved state =
   let
     fmtGoal Goal{..} =
@@ -963,8 +964,8 @@ solved state =
               fromR = preimages nf goal_rhs
               fromL2 = preimagesResimpl nf goal_lhs
               fromR2 = preimagesResimpl nf goal_rhs
-              showOne (orig, _r) = "      - " ++ prettyShow orig
-              showOneT t = "      - " ++ prettyShow t ++ " (resimplified)"
+              showOne (orig, _r) = "      - " ++ pShowTerm orig
+              showOneT t = "      - " ++ pShowTerm t ++ " (resimplified)"
               linesL = if null fromL && null fromL2 then [] else ("    origins from lhs:" : (map showOne fromL ++ map showOneT fromL2))
               linesR = if null fromR && null fromR2 then [] else ("    origins from rhs:" : (map showOne fromR ++ map showOneT fromR2))
           in if null linesL && null linesR then "" else ("\n" ++ unlines (linesL ++ linesR))
@@ -976,46 +977,185 @@ solved state =
               let sameHead t = case t of { App g _ -> fun_id g == fun_id f; _ -> False }
                   rulesAll = Index.elems (index_all (st_rules state))
                   defs = [ r | r <- rulesAll, sameHead (lhs r) ]
-                  one r = "      - " ++ prettyShow (unorient r)
+                  one r = "      - " ++ pShowEqn (unorient r)
               in if null defs then "" else ("\n    definitions:" ++ "\n" ++ unlines (map one defs))
             _ -> ""
         -- show rules that produce this constant as RHS exactly
         showProducers nf =
           let rulesAll = Index.elems (index_all (st_rules state))
               pros = [ r | r <- rulesAll, rhs r == nf ]
-              one r = "      - " ++ prettyShow (unorient r)
+              one r = "      - " ++ pShowEqn (unorient r)
               -- terms without numbered symbols
               funHasDigits f = any isDigit (prettyShow f)
               termHasDigits t = any funHasDigits (collect t)
               plainTerms = [ lhs r | r <- pros, not (termHasDigits (lhs r)) ]
               plainSorted = sortOn len plainTerms
-              onePlain t = "      - " ++ prettyShow t ++ "  (size=" ++ show (len t) ++ ")"
+              onePlain t = "      - " ++ pShowTerm t ++ "  (size=" ++ show (len t) ++ ")"
               sectionPlain = if null plainTerms then "" else ("\n    produced (no numbered symbols), by size:" ++ "\n" ++ unlines (map onePlain plainSorted))
           in if null pros then "" else ("\n    produced by rules:" ++ "\n" ++ unlines (map one pros) ++ sectionPlain)
         -- show joinable equations mentioning the constant
         showJoinable nf =
           let js = [ e | e@(t :=: u) <- Index.elems (st_joinable state), t == nf || u == nf ]
-              one (t :=: u) = "      - " ++ prettyShow t ++ " = " ++ prettyShow u
+              one (t :=: u) = "      - " ++ pShowTerm t ++ " = " ++ pShowTerm u
           in if null js then "" else ("\n    joinable equations:" ++ "\n" ++ unlines (map one js))
-        extraL = if isConst lhsS then showOrigins lhsS ++ showDefs lhsS ++ showProducers lhsS ++ showJoinable lhsS else ""
-        extraR = if isConst rhsS then showOrigins rhsS ++ showDefs rhsS ++ showProducers rhsS ++ showJoinable rhsS else ""
-        -- collect all function symbols used in these terms
+        -- collect all function symbols used in these terms (after decoding constants)
         collect :: Term f -> [Fun f]
         collect (Var _) = []
         collect (App f xs) = f : concatMap collect (unpack xs)
-        funs = usort (collect lhs0 ++ collect rhs0 ++ collect lhsS ++ collect rhsS)
+        collectDecoded t = collect (decodeTerm t)
+        funs = usort (collectDecoded lhs0 ++ collectDecoded rhs0 ++ collectDecoded lhsS ++ collectDecoded rhsS)
+        pShowEqn (t :=: u) = pShowTerm t ++ " = " ++ pShowTerm u
+        prettyName t = prettyShow t
+        hasDigitsFun f = any isDigit (prettyShow f)
+        hasDigitsTerm t = any hasDigitsFun (collect t)
+        isZeroArity t = case t of { Var _ -> False; App _ xs -> null (unpack xs) }
+        -- pull rule/joinable sets for decoding
+        rulesAll = Index.elems (index_all (st_rules state))
+        joinables = Index.elems (st_joinable state)
+        axiomsEqns = map axiom_eqn (st_axioms state)
+        -- neighbors by equality (joinables) and 0-arity rule equalities
+        neighbors x =
+          let eqs = [ y | (t :=: u) <- joinables ++ axiomsEqns, let y = if t == x then u else t, t == x || u == x ]
+              rls = [ y | r <- rulesAll
+                       , let l = lhs r
+                       , let r0 = rhs r
+                       , isZeroArity l && isZeroArity r0
+                       , let y = if l == x then r0 else l
+                       , l == x || r0 == x ]
+          in eqs ++ rls
+        closure start = go IntSet.empty [start]
+          where
+            go _ [] = []
+            go seen (y:ys) =
+              let key = termKey y
+                  seen' = if key `IntSet.member` seen then seen else IntSet.insert key seen
+                  ns = if seen' == seen then [] else neighbors y
+              in if seen' == seen then go seen ys else y : go seen' (ns ++ ys)
+        -- key for visited: simple rolling hash of prettyShow; avoids extra imports
+        termKey t = fromIntegral (abs (hashString (prettyShow t)) `mod` (maxBound :: Int))
+        hashString :: String -> Int
+        hashString = foldl' (\h c -> h * 131 + fromEnum c) 0
+        chooseBest xs =
+          let xs0 = filter isZeroArity xs
+              xs1 = filter (not . hasDigitsTerm) xs0
+          in case xs1 of
+               (z:_) -> z
+               [] -> case xs of
+                 (z:_) -> z
+                 [] -> error "empty class"
+        decodeConst c0 =
+          let cls = closure c0
+          in chooseBest cls
+          --     cand0 = cls ++ defsOf c0
+          --     candsRaw = [ t | t <- cand0, t /= c0 ]
+          --     cands = [ decodeTerm (normaliseToNF t) | t <- candsRaw ]
+          -- in case cands of
+          --      [] -> c0
+          --      xs -> foldl1 pickBetter (c0:xs)
+        decodeTerm t = case t of
+          Var _ -> t
+          App _ xs | null (unpack xs) ->
+            let c = t
+                d = decodeConst c
+            in if d == c then c else decodeTerm d
+          _ -> t
+          -- App f xs ->
+          --   let xs' = map decodeTerm (unpack xs)
+          --       t' = build (app f xs')
+          --   in if null (unpack xs) then
+          --     -- Handle constants (0-arity terms)
+          --     decodeConst t'
+          --   else
+          --     -- For compound terms, just return with decoded subterms
+          --     t'
+        pShowTerm t = prettyShow (decodeTerm t)
+        pShowAny x  = prettyShow x
         describe f =
           let nameShown = prettyShow f
               ident     = show (fun_id f)
               occArity t = case t of { App g ys | theSame g -> Just (length (unpack ys)); _ -> Nothing }
               theSame g = fun_id g == fun_id f
               arities = mapMaybe occArity (subterms lhs0 ++ subterms rhs0 ++ subterms lhsS ++ subterms rhsS)
-              arityStr = case usort arities of { [] -> "?"; [n] -> show n; ns -> show ns }
+              arityStr =
+                if f `elem` aliasFuns then "0" else
+                  case usort arities of { [] -> "?"; [n] -> show n; ns -> show ns }
           in "  - " ++ nameShown ++ "  (id=" ++ ident ++ ", arity=" ++ arityStr ++ ")"
-        symTable = if null funs then "" else "\n  Symbols used:\n" ++ unlines (map describe funs)
-      in "goal " ++ show goal_number ++ " (" ++ goal_name ++ "):\n  lhs: " ++ prettyShow lhs0 ++ " -> " ++ prettyShow lhsS ++ extraL ++
-         "\n  rhs: " ++ prettyShow rhs0 ++ " -> " ++ prettyShow rhsS ++ extraR ++ symTable
-    -- Optional: try to show a decoded/presented goal if we have any solutions so far
+        -- diagnostics: list all known equivalences among 0-arity terms reachable via joinables and 0-arity rules
+        zerosIn t = [ s | s <- subterms t, isZeroArity s ]
+        zerosRules = concat [ zerosIn (lhs r) ++ zerosIn (rhs r) | r <- rulesAll ]
+        zerosJoin = concat [ zerosIn t ++ zerosIn u | (t :=: u) <- joinables ]
+        zerosAxioms = concat [ zerosIn t ++ zerosIn u | (t :=: u) <- axiomsEqns ]
+        zerosGoals = zerosIn lhs0 ++ zerosIn rhs0 ++ zerosIn lhsS ++ zerosIn rhsS
+        zerosGoalsDecoded = zerosIn (decodeTerm lhs0) ++ zerosIn (decodeTerm rhs0) ++ zerosIn (decodeTerm lhsS) ++ zerosIn (decodeTerm rhsS)
+        zerosAll = usort (zerosRules ++ zerosJoin ++ zerosAxioms ++ zerosGoals ++ zerosGoalsDecoded)
+        -- include 0-arity alias funs into symbol table
+        aliasFuns = usort [ f | App f xs <- zerosAll, null (unpack xs) ]
+        funs2 = usort (funs ++ aliasFuns)
+        classOf c = usort (closure c)
+        classes = Map.fromListWith (++)
+          [ (pShowTerm (chooseBest (classOf c)), [prettyShow c]) | c <- zerosAll ]
+        showClass (rep, cs) = "  - " ++ rep ++ " := { " ++ intercalate ", " (usort cs) ++ " }"
+        eqnSection = if Map.null classes then "" else "\n  Known equivalences (0-arity):\n" ++ unlines (map showClass (Map.toList classes))
+        -- alias definitions: map each 0-arity alias to a simple defining term if available
+        defsOf c =
+          let fromRules = [ if lhs r == c then rhs r else lhs r | r <- rulesAll, lhs r == c || rhs r == c ]
+              fromAxioms = [ if t == c then u else t | (t :=: u) <- axiomsEqns, t == c || u == c ]
+          in fromRules ++ fromAxioms
+        scoreTerm t = (fromEnum (hasDigitsTerm t), len t, length (prettyShow t))
+        pickBetter a b = if scoreTerm a <= scoreTerm b then a else b
+        normaliseToNF t =
+          let r = normaliseTerm state t in
+          result t r
+        chooseDefDirect c =
+          let cand0 = defsOf c
+              candsRaw = [ t | t <- cand0, t /= c ]
+              cands = [ decodeTerm (normaliseToNF t) | t <- candsRaw ]
+          in case cands of
+               [] -> Nothing
+               xs -> Just (foldl1 pickBetter xs)
+        chooseDefClosure c =
+          let cand0 = classOf c
+              candsRaw = [ t | t <- cand0, t /= c ]
+              cands = [ decodeTerm (normaliseToNF t) | t <- candsRaw ]
+          in case cands of
+               [] -> Nothing
+               xs -> Just (foldl1 pickBetter xs)
+        renderDef c =
+          let name = prettyShow c
+              md = chooseDefDirect c
+              mc = chooseDefClosure c
+              candAll =
+                let raw = [ t | t <- classOf c ++ defsOf c, t /= c ]
+                in [ decodeTerm (normaliseToNF t) | t <- raw ]
+              mstruct = case filter (not . hasDigitsTerm) candAll of
+                [] -> Nothing
+                xs -> Just (foldl1 pickBetter xs)
+              lineStruct s =
+                let ss = pShowTerm s in
+                case (md, mc) of
+                  (Just d, _) | pShowTerm d == ss -> []
+                  (_, Just cl) | pShowTerm cl == ss -> []
+                  _ -> ["  - " ++ name ++ " := " ++ ss ++ " [structural]"]
+              linesDC = case (md, mc) of
+                (Nothing, Nothing) -> ["  - " ++ name ++ " := <no definition found>"]
+                (Just d, Nothing) -> ["  - " ++ name ++ " := " ++ pShowTerm d ++ " [direct]"]
+                (Nothing, Just cl) -> ["  - " ++ name ++ " := " ++ pShowTerm cl ++ " [closure]"]
+                (Just d, Just cl) ->
+                  let sd = pShowTerm d; sc = pShowTerm cl in
+                  if sd == sc
+                  then ["  - " ++ name ++ " := " ++ sd ++ " [direct/closure]"]
+                  else ["  - " ++ name ++ " := " ++ sd ++ " [direct]",
+                        "  - " ++ name ++ " := " ++ sc ++ " [closure]"]
+          in linesDC ++ maybe [] lineStruct mstruct
+        defsLines = concatMap renderDef zerosAll
+        defsSection = if null defsLines then "" else "\n  Alias definitions:\n" ++ unlines (usort defsLines)
+        symTable = if null funs2 then "" else "\n  Symbols used:\n" ++ unlines (map describe funs2)
+        extraL = if isConst lhsS then showOrigins lhsS ++ showDefs lhsS ++ showProducers lhsS ++ showJoinable lhsS else ""
+        extraR = if isConst rhsS then showOrigins rhsS ++ showDefs rhsS ++ showProducers rhsS ++ showJoinable rhsS else ""
+      in "goal " ++ show goal_number ++ " (" ++ goal_name ++ "):\n  lhs: " ++ prettyShow lhs0 ++ " -> " ++ prettyShow lhsS ++ " -> " ++ pShowTerm lhsS ++ extraL ++
+         "\n  rhs: " ++ prettyShow rhs0 ++ " -> " ++ prettyShow rhsS ++ " -> " ++ pShowTerm rhsS ++ extraR ++ symTable ++ eqnSection ++ defsSection ++
+         "\n  Simplified with aliases resolved:\n    lhs: " ++ pShowTerm lhsS ++ "\n    rhs: " ++ pShowTerm rhsS
+    -- Optional: try to show a decoded/presented view (if any solution exists)
     decoded =
       case solutions state of
         [] -> ""
