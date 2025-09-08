@@ -56,11 +56,12 @@ data MainFlags =
     flags_equals_transformation :: Bool,
     flags_distributivity_heuristic :: Bool,
     flags_kbo_weight0 :: Bool,
+    flags_kbo_weight0_unary :: Bool,
     flags_goal_heuristic :: Bool }
 
 parseMainFlags :: OptionParser MainFlags
 parseMainFlags =
-  MainFlags <$> proof <*> trace <*> formal <*> explain <*> flipOrdering <*> giveUp <*> flatten <*> flattenNonGround <*> flattenLightly <*> flattenAll <*> flattenRegeneralise <*> eliminate <*> backwardsGoal <*> flattenBackwardsGoal <*> equalsTransformation <*> distributivityHeuristic <*> kboWeight0 <*> goalHeuristic
+  MainFlags <$> proof <*> trace <*> formal <*> explain <*> flipOrdering <*> giveUp <*> flatten <*> flattenNonGround <*> flattenLightly <*> flattenAll <*> flattenRegeneralise <*> eliminate <*> backwardsGoal <*> flattenBackwardsGoal <*> equalsTransformation <*> distributivityHeuristic <*> kboWeight0 <*> kboWeight0Unary <*> goalHeuristic
   where
     proof =
       inGroup "Output options" $
@@ -88,6 +89,10 @@ parseMainFlags =
       expert $
       inGroup "Term order options" $
       bool "kbo-weight0" ["Give functions of arity >= 2 a weight of 0."] False
+    kboWeight0Unary =
+      expert $
+      inGroup "Term order options" $
+      bool "kbo-weight0-unary" ["Give one function of arity 1 a weight of 0."] False
     giveUp =
       expert $
       inGroup "Output options" $
@@ -148,8 +153,8 @@ parseConfig :: OptionParser (Config Constant)
 parseConfig =
   Config <$> maxSize <*> maxCPs <*> maxCPDepth <*> maxRules <*> simplify <*> normPercent <*> cpSampleSize <*> cpRenormaliseThreshold <*> set_join_goals <*> always_simplify <*> complete_subsets <*>
     pure undefined <*> -- scoring function - filled in later, in runTwee
-    (Join.Config <$> ground_join <*> connectedness <*> ground_connectedness <*> set_join) <*>
-    (Proof.Config <$> all_lemmas <*> flat_proof <*> ground_proof <*> show_instances <*> colour <*> show_axiom_uses) <*> pure [] <*> randomMode <*> randomModeGoalDirected <*> randomModeSimple <*> randomModeBestOf <*> alwaysComplete
+    (Join.Config <$> ground_join <*> connectedness <*> ground_connectedness <*> set_join <*> ground_join_limit <*> ground_join_incomplete_limit) <*>
+    (Proof.Config <$> all_lemmas <*> flat_proof <*> ground_proof <*> show_instances <*> colour <*> show_axiom_uses <*> show_peaks <*> eliminate_existentials_coding) <*> pure [] <*> randomMode <*> randomModeGoalDirected <*> randomModeSimple <*> randomModeBestOf <*> alwaysComplete
   where
     maxSize =
       inGroup "Resource limits" $
@@ -188,6 +193,12 @@ parseConfig =
       bool "ground-joining"
         ["Test terms for ground joinability (on by default)."]
         True
+    ground_join_limit =
+      inGroup "Critical pair joining heuristics" $
+      flag "ground-joining-limit" ["Assume not ground joinable after considering this many orderings (unlimited by default)."] maxBound argNum
+    ground_join_incomplete_limit =
+      inGroup "Critical pair joining heuristics" $
+      flag "ground-joining-incomplete-limit" ["Assume ground joinable after considering this many orderings (unlimited by default)."] maxBound argNum
     connectedness =
       expert $
       inGroup "Critical pair joining heuristics" $
@@ -257,6 +268,16 @@ parseConfig =
         (splitOn "," <$> arg "<axioms>" "expected a list of axiom names" Just)
       where
         interpret xss ax = axiom_name ax `elem` xss || "all" `elem` xss
+    show_peaks =
+      inGroup "Proof presentation" $
+      bool "show-peaks"
+        ["Show peak terms in a proof (off by default)."]
+        False
+    eliminate_existentials_coding =
+      inGroup "Proof presentation" $
+      bool "eliminate-existentials-coding"
+        ["Eliminate $equals from proofs (on by default)."]
+        True
     randomMode =
       expert $
       inGroup "Completion heuristics" $
@@ -351,6 +372,7 @@ parsePrecedence =
 
 data Constant =
   Minimal |
+  Skolem Int |
   Constant {
     con_prec   :: {-# UNPACK #-} !Precedence,
     con_id     :: {-# UNPACK #-} !Jukebox.Function,
@@ -365,13 +387,16 @@ data Precedence = Precedence !Bool !Bool !Bool !(Maybe Int) !Int
 
 instance KBO.Sized Constant where
   size Minimal = 1
+  size Skolem{} = 1
   size Constant{..} = con_size
 instance KBO.Weighted Constant where
   argWeight Minimal = 1
+  argWeight Skolem{} = 1
   argWeight Constant{..} = con_weight
 
 instance Pretty Constant where
   pPrint Minimal = text "?"
+  pPrint (Skolem n) = text ("sk" ++ show n)
   pPrint Constant{..} = text (removePostfix (base con_id))
     where
       removePostfix ('_':x:xs) | con_arity == 1 = x:xs
@@ -379,6 +404,7 @@ instance Pretty Constant where
 
 instance PrettyTerm Constant where
   termStyle Minimal = uncurried
+  termStyle Skolem{} = uncurried
   termStyle Constant{..}
     | hasLabel "type_tag" con_id = invisible
     | "_" `isPrefixOf` base con_id && con_arity == 1 = postfix
@@ -391,6 +417,7 @@ instance PrettyTerm Constant where
 
 instance Minimal Constant where
   minimal = fun Minimal
+  skolem = fun . Skolem
 
 instance Ordered Constant where
   lessEq t u = KBO.lessEq t u
@@ -399,12 +426,16 @@ instance Ordered Constant where
 
 instance EqualsBonus Constant where
   hasEqualsBonus Minimal = False
+  hasEqualsBonus Skolem{} = False
   hasEqualsBonus c = con_bonus c
   isEquals Minimal = False
+  isEquals Skolem{} = False
   isEquals c = SequentialMain.isEquals (con_id c)
   isTrue Minimal = False
+  isTrue Skolem{} = False
   isTrue c = SequentialMain.isTrue (con_id c)
   isFalse Minimal = False
+  isFalse Skolem{} = False
   isFalse c = SequentialMain.isFalse (con_id c)
 
 data TweeContext =
@@ -425,7 +456,7 @@ tweeConstant MainFlags{..} flags TweeContext{..} prec fun
       con_prec = prec,
       con_id = fun,
       con_arity = Jukebox.arity fun,
-      con_size = if flags_kbo_weight0 && Jukebox.arity fun >= 2 then 0 else if isInv then 0 else 1,
+      con_size = if flags_kbo_weight0 && Jukebox.arity fun >= 2 then 0 else if flags_kbo_weight0_unary && isInv then 0 else 1,
       con_weight = 1,
       con_bonus = bonus fun }
   where
@@ -528,7 +559,7 @@ flattenGoals backwardsGoal flattenNonGround flattenAll full prob =
       let vs  = Jukebox.vars ts
           g = name ::: FunType (map typ vs) (typ f)
           c = clause [Pos (g :@: map Jukebox.Var vs Jukebox.:=: f :@: ts)]
-      return Input{tag = "flattening", kind = Jukebox.Ax Definition,
+      return Input{ident = Nothing, tag = "flattening", kind = Jukebox.Ax Definition,
                    what = c, source = Unknown }
 
     backwards 0 _ t = [t]
@@ -582,7 +613,7 @@ addDistributivityHeuristic prob =
       let vs  = Jukebox.vars t
           g = name ::: FunType (map typ vs) (typ t)
           c = clause [Pos (g :@: map Jukebox.Var vs Jukebox.:=: t)]
-      return Input{tag = "distributivity_heuristic", kind = Jukebox.Ax Definition,
+      return Input{ident = Nothing, tag = "distributivity_heuristic", kind = Jukebox.Ax Definition,
                    what = c, source = Unknown }
 
 -- Encode existentials so that all goals are ground.
@@ -590,7 +621,9 @@ addNarrowing :: Bool -> TweeContext -> Problem Clause -> Problem Clause
 addNarrowing alwaysNarrow TweeContext{..} prob =
   unchanged ++ equalityClauses
   where
-    (unchanged, nonGroundGoals) = partitionEithers (map f prob)
+    prob' = [inp { ident = Just (variant "addNarrowing" [i :: Int]) } | (i, inp) <- zip [0..] prob]
+
+    (unchanged, nonGroundGoals) = partitionEithers (map f prob')
       where
         f inp@Input{what = Clause (Bind _ [Neg (x Jukebox.:=: y)])}
           | not (ground x) || not (ground y) || alwaysNarrow =
@@ -616,6 +649,7 @@ addNarrowing alwaysNarrow TweeContext{..} prob =
           -- Equisatisfiable to the input clauses
           justification =
             Input {
+              ident = Just (name "addNarrowing2"),
               tag  = "new_negated_conjecture",
               kind = Jukebox.Ax NegatedConjecture,
               what =
@@ -625,15 +659,16 @@ addNarrowing alwaysNarrow TweeContext{..} prob =
                 inference "encode_existential" "esa"
                   (map (fmap toForm . fst) nonGroundGoals) }
 
-          input tag form =
+          input tag form i =
             Input {
+              ident = Just (variant "addNarrowing3" [i :: Int]),
               tag = tag,
-              kind = Conj Conjecture,
+              kind = Jukebox.Ax NegatedConjecture,
               what = clause [form],
               source =
                 inference "split_conjunct" "thm" [justification] }
 
-        in [input tag form | (tag, form) <- equalityLiterals]
+        in [input tag form i | ((tag, form), i) <- zip equalityLiterals [0..]]
 
 data PreEquation =
   PreEquation {
@@ -937,7 +972,7 @@ runTwee globals (TSTPFlags tstp) horn precedence config0 cpConfig flags@MainFlag
       print $ pPrintProof $
         map pre_form axioms0 ++
         map pre_form goals0 ++
-        [ Input "rule" (Jukebox.Ax Jukebox.Axiom) Unknown $
+        [ Input Nothing "rule" (Jukebox.Ax Jukebox.Axiom) Unknown $
             toForm $ clause
               [Pos (jukeboxTerm ctx (lhs rule) Jukebox.:=: jukeboxTerm ctx (rhs rule))]
         | rule <- rules state ]
@@ -970,6 +1005,7 @@ presentToJukebox ::
   Problem Form
 presentToJukebox ctx toEquation axioms goals Presentation{..} =
   [ Input {
+      ident = Nothing,
       tag = pg_name,
       kind = Jukebox.Ax Jukebox.Axiom,
       what = false,
@@ -984,11 +1020,15 @@ presentToJukebox ctx toEquation axioms goals Presentation{..} =
   where
     axiom_proofs =
       Map.fromList
-        [ (axiom_number, fromJust (lookup axiom_number axioms))
+        [ (axiom_number, (fromJust (lookup axiom_number axioms)) { ident = Just (ident axiom_number) })
         | Axiom{..} <- pres_axioms ]
+      where
+        ident i = variant "axiom" [i]
 
     lemma_proofs =
-      Map.fromList [(p, tstp p) | p <- pres_lemmas]
+      Map.fromList [(p, (tstp p) { ident = Just (ident i) }) | (i, p) <- zip [0..] pres_lemmas]
+      where
+        ident i = variant "lemma" [i :: Int]
 
     goal_proofs =
       Map.fromList [(pg_number, tstp pg_proof) | ProvedGoal{..} <- pres_goals]
@@ -999,6 +1039,7 @@ presentToJukebox ctx toEquation axioms goals Presentation{..} =
     deriv :: Derivation Constant -> Input Form
     deriv p =
       Input {
+        ident = Nothing,
         tag = "step",
         kind = Jukebox.Ax Jukebox.Axiom,
         what = jukeboxEquation (equation (certify p)),
