@@ -57,6 +57,7 @@ executable twee
   build-depends:       base < 5,
                        twee-lib == 2.5,
                        containers,
+                       time,
                        pretty,
                        split,
                        jukebox >= 0.5.8,

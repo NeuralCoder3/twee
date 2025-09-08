@@ -1,0 +1,1 @@
+docker run -it -v $PWD:/app haskell:9.12 bash
