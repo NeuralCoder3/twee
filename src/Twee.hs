@@ -2,6 +2,7 @@
 {-# LANGUAGE RecordWildCards, MultiParamTypeClasses, GADTs, BangPatterns, OverloadedStrings, ScopedTypeVariables, GeneralizedNewtypeDeriving, PatternGuards, TypeFamilies, FlexibleInstances, RankNTypes, TupleSections #-}
 module Twee where
 
+import System.IO.Unsafe (unsafePerformIO)
 import Twee.Base
 import Twee.Rule hiding (normalForms)
 import qualified Twee.Rule as Rule
@@ -74,7 +75,9 @@ data Config f =
     cfg_random_mode_best_of       :: Int,
     cfg_always_complete           :: Bool,
     cfg_hint_skel_cost            :: Float,
-    cfg_hint_skel_factor          :: Float }
+    cfg_hint_skel_factor          :: Float,
+    cfg_fold_term                 :: Maybe (Term f -> Maybe (Term f))
+     }
 
 -- | The prover state.
 data State f =
@@ -122,7 +125,9 @@ defaultConfig =
     cfg_random_mode_simple = False,
     cfg_always_complete = False,
     cfg_hint_skel_cost = 1,
-    cfg_hint_skel_factor = 0 }
+    cfg_hint_skel_factor = 0,
+    cfg_fold_term = Nothing
+  }
 
 -- | Does this configuration run the prover in a complete mode?
 configIsComplete :: Config f -> Bool
@@ -442,15 +447,58 @@ instance f ~ g => Has (Active f) (Positions2 g) where the = active_positions
 -- Add a new active.
 {-# INLINEABLE addActive #-}
 addActive :: Function f => Config f -> State f -> (Id -> Active f) -> State f
-addActive config state@State{..} active0 =
+addActive config@Config{..} state@State{..} active0 =
   let
+    -- 1. Get the original active. It gets ID 'st_next_active'
     active@Active{..} = active0 st_next_active
+    
+    -- 2. Find folding rules from this active.
+    --    These will get IDs starting from 'st_next_active + 1'
+    (axiomsState, next_active_after_axioms) =
+      case cfg_fold_term of
+        Nothing -> (state, st_next_active) -- No folding configured
+        Just fold_fn ->
+          let
+            -- Get all unique subterms from the new rule
+            all_subterms = usort (subterms (lhs active_rule) ++ subterms (rhs active_rule))
+            
+            -- Try to fold each one
+            tryFold t = do
+              rhs <- fold_fn t -- Apply the user's folding function
+              return (t :=: rhs)
+            
+            new_fold_eqns = mapMaybe tryFold all_subterms
+            
+            -- Create new axioms for each folded equation
+            makeAxiom n eqn =
+              Axiom {
+                axiom_name   = "constant-fold",
+                axiom_number = -n, -- Use negative numbers for generated axioms
+                axiom_eqn    = eqn
+              }
+            
+            -- Start axiom numbering from *after* the current active
+            new_axioms = zipWith makeAxiom [fromIntegral st_next_active + 1..] new_fold_eqns
+            
+            -- Add axioms to the state, starting from the *original* state
+            axiomsState = foldl' (addAxiom config) state new_axioms
+            
+            -- Return the new state and the updated ID counter
+          -- in (axiomsState, st_next_active axiomsState)
+          in (axiomsState, (\(State{st_next_active = n}) -> n) axiomsState)
+
+    -- 3. Now add the *original* active (e.g., add(2,V1) -> V2)
+    --    It must be added to the state *that contains the new axioms*.
+    --    Its ID is 'st_next_active' (from the original state).
+    --    The state's ID counter must be bumped to 'next_active_after_axioms + 1'.
     state' =
       message (NewActive active) $
-      addActiveOnly state{st_next_active = st_next_active+1} active
+      addActiveOnly axiomsState{st_next_active = next_active_after_axioms + 1} active
+      
   in if subsumed (st_joinable, st_complete) st_rules (unorient active_rule) then
-    state
+    axiomsState -- The original rule was subsumed, but we keep the new folded axioms
   else
+    -- The original rule is kept, along with the new axioms
     normaliseGoals config $
     enqueueRule state' active
   where
@@ -822,6 +870,7 @@ complete Output{..} config@Config{..} state =
            lift $ output_message (NotComplete (st_not_complete state'))
            StateM.put $! state',
        newTask 1 0.05 $ do
+      --  newTask 0.1 0.05 $ do
          when cfg_simplify $ do
            lift $ output_message Interreduce
            state <- StateM.get
@@ -957,10 +1006,84 @@ goalTerms state =
     goalTerm <- [t, u] ]
 -}
 
+is_named_term :: (Function f, Ordered f, Minimal f, PrettyTerm f, EqualsBonus f, Labelled f) => Term f -> Bool
+is_named_term t = 
+  let s = prettyShow t in
+  -- [a-z]+\d+, starts with some letters, ends in digits
+  let isDigit c = c >= '0' && c <= '9' in
+  let isAlpha c = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') in
+  let (letters, digits) = span isAlpha s in
+  not (null letters) && not (null digits) && all isDigit digits
+
+debug_info :: Function f => State f -> a -> a
+debug_info s a = 
+  unsafePerformIO $ do
+    -- Debugging information
+    -- putStrLn "\n\n\nDebug info: "
+
+    let equations = [axiom_eqn ax | ax <- st_axioms s]
+    let rules = [r | r <- (Index.elems (index_all (st_rules s)))] ++
+                 [r | r <- (IntMap.elems (st_active_set s)) >>= activeRules]
+    -- filter named equations out of both and keep in separate list
+    let named_equations = equations
+          & filter (\eqn -> is_named_term (eqn_lhs eqn) || is_named_term (eqn_rhs eqn)) 
+    -- let equations :: [Equation f]
+    --     equations =
+    --       equations
+    --       & filter (\eqn -> not (is_named_term (eqn_lhs eqn) || is_named_term (eqn_rhs eqn)))
+    let named_rules =
+          rules
+          & filter (\r -> is_named_term (lhs r) || is_named_term (rhs r))
+    -- let rules :: [Rule f]
+    --     rules =
+    --       rules
+    --       & filter (\r -> not ((is_named_term (lhs r)) || (is_named_term (rhs r))))
+
+    -- putStrLn $ "Named Equations: \n  " ++
+    --   intercalate "\n  " [prettyShow eqn | eqn <- named_equations]
+    -- putStrLn $ "Named Rules: \n  " ++
+    --   intercalate "\n  " [prettyShow r | r <- named_rules]
+
+    -- putStrLn $ "Axioms: \n  " ++ 
+    --   intercalate "\n  " [prettyShow (axiom_eqn ax) | ax <- st_axioms s]
+    -- putStrLn $ "Rules All: \n  " ++ 
+    --   intercalate "\n  " [
+    --     case (orientation r) of
+    --       Oriented -> prettyShow (lhs r) ++ " -> " ++ prettyShow (rhs r)
+    --       _ -> prettyShow (lhs r) ++ " <-> " ++ prettyShow (rhs r)
+    --   | r <- (Index.elems (index_all (st_rules s)))]
+    -- putStrLn $ "Active Set: \n  " ++ 
+    --   intercalate "\n  " [
+    --     prettyShow (lhs r) ++ " -> " ++ prettyShow (rhs r)
+    --   | r <- (IntMap.elems (st_active_set s)) >>= activeRules ]
+
+    --   intercalate "\n  " [prettyShow (active_rule a) | a <- IntMap.elems (st_active_set s)]
+
+    -- print st_axioms list (use pPrint for each inner)
+    -- putStrLn $ "Rules Oriented: \n  " ++ 
+    --   intercalate "\n  " [prettyShow (lhs r) ++ " -> " ++ prettyShow (rhs r)
+    --   | r <- (Index.elems (index_oriented (st_rules s)))]
+    -- putStrLn $ "Rules: \n  " ++ 
+    --   intercalate "\n  " [prettyShow (rule_eqn r) | r <- st_rules s]
+    --   intercalate "\n  " [prettyShow (canonicalise r) | r <- st_rules s]
+    --   intercalate "\n  " [prettyShow (r) | r <- st_rules s]
+    -- putStrLn $ "Active Set: \n  " ++ 
+    --   intercalate "\n  " [prettyShow (active_rule a) | a <- IntMap.elems (st_active_set s)]
+    -- putStrLn $ "Joinable equations: \n  " ++ 
+    --   intercalate "\n  " [prettyShow eqn | (_, eqn) <- Index.toList (st_joinable s)]
+    -- Queue
+
+    -- putStrLn $ "Number of active rules: " ++ show (IntMap.size (st_active_set s))
+    -- putStrLn $ "Number of goals: " ++ show (length (st_goals s))
+    -- putStrLn $ "Number of solutions: " ++ show (length (solutions s))
+    return a
+
 
 {-# INLINEABLE solved #-}
 solved :: Function f => State f -> Bool
-solved = not . null . solutions
+solved s =
+  (debug_info s) .
+  not . null . solutions $ s
 
 -- Return whatever goals we have proved and their proofs.
 {-# INLINEABLE solutions #-}

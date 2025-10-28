@@ -23,6 +23,12 @@ import Data.Maybe
 import Jukebox.Options
 import Jukebox.Toolbox
 import Jukebox.Name hiding (lhs, rhs, label)
+-- import qualified Jukebox.Name as Name
+import Text.Read (readMaybe)
+import Data.List (isPrefixOf)
+-- 'Data.Maybe' is likely already imported, but add 'mapMaybe' if not
+import Data.Maybe (mapMaybe, fromJust)
+
 import qualified Jukebox.Form as Jukebox
 import Jukebox.Form hiding ((:=:), Var, Symbolic(..), Term, Axiom, size, Subst, subst)
 import Jukebox.Tools.EncodeTypes
@@ -778,6 +784,96 @@ runTwee globals (TSTPFlags tstp) horn precedence config0 cpConfig flags@MainFlag
         [] -> Nothing
         xs -> Just (fst (maximumBy (comparing snd) xs))
 
+
+
+    -- | Gets the string name from a 'Constant'
+    getConstName :: Constant -> Maybe String
+    getConstName Constant{..} = Just (base con_id)
+    getConstName _ = Nothing
+    
+    -- | Parses a 'num' or 'numneg' constant string into an Integer
+    parseConstVal :: Constant -> Maybe Integer
+    parseConstVal c = getConstName c >>= parseNum
+      where
+        parseNum s
+          | "num" `isPrefixOf` s, Just n <- readMaybe (drop 3 s) = Just n
+          | "numneg" `isPrefixOf` s, Just n <- readMaybe (drop 6 s) = Just (-n)
+          | otherwise = Nothing
+    
+    -- | Gets the operator name if it's a binary function
+    getOpName :: Constant -> Maybe String
+    getOpName c@Constant{..} | con_arity == 2 = Just (base con_id)
+    getOpName _ = Nothing
+    
+
+    -- | Builds a new 'Term Constant' for a given Integer result.
+    buildConstant :: Integer -> Term Constant
+    buildConstant n = tweeTerm flags horn ctx prec (newJubFun :@: [])
+      where
+        newNameStr | n >= 0    = "num" ++ show n
+                   | otherwise = "numneg" ++ show (abs n)
+
+        -- Create a new Jukebox.Name for the constant
+        newJubName = Jukebox.Name.name newNameStr --
+
+        -- Get the base type for constants (e.g., from '$true')
+        const_type = Jukebox.Form.typ (ctx_true ctx) --
+
+        -- Create a new Jukebox.Function (symbol) with arity 0
+        newJubFun  = newJubName ::: (FunType [] const_type) --
+
+    -- | Builds a new 'Term Constant' for a given Integer result.
+    -- | This re-uses the 'tweeConstant' machinery to build a valid Constant
+    -- | that Twee can understand.
+    -- buildConstant :: Integer -> Term Constant
+    -- -- buildConstant n = build (fun newConst)
+    -- -- buildConstant n = build (app (fun newConst) [])
+    -- buildConstant n = fun newConst
+    --   where
+    --     newNameStr | n >= 0    = "num" ++ show n
+    --                | otherwise = "numneg" ++ show (abs n)
+        
+    --     -- Create a new Jukebox.Name for the constant
+    --     -- newJubName = intern newNameStr
+    --     newJubName = Jukebox.Name.name newNameStr
+        
+    --     -- Get the base type for constants (e.g., from '$true')
+    --     const_type = Jukebox.Form.typ ctx_true --
+        
+    --     -- Create a new Jukebox.Function (symbol) with arity 0
+    --     newJubFun  = newJubName ::: (FunType [] const_type) --
+        
+    --     -- Create the Twee 'Constant' value using the existing function
+    --     newConst = tweeConstant flags horn ctx (prec newJubFun) newJubFun
+
+    -- | The main constant folding function to be passed to Twee.
+    constantFolder :: Term Constant -> Maybe (Term Constant)
+    constantFolder t@(App oper (Cons (App c1 Nil) (Cons (App c2 Nil) Nil))) = do
+        -- Get the 'Constant' values from the 'Fun' wrappers
+        let op = fun_value oper
+            const1 = fun_value c1
+            const2 = fun_value c2
+        
+        -- Get their names and values
+        opName <- getOpName op
+        val1 <- parseConstVal const1
+        val2 <- parseConstVal const2
+        
+        -- Evaluate the operation and build a new result term
+        rhsTerm <-
+          case opName of
+            "mul" -> Just (buildConstant (val1 * val2))
+            "div" | val2 /= 0 -> Just (buildConstant (val1 `div` val2))
+                  | otherwise -> Nothing -- Don't fold division by zero
+            _     -> Nothing
+
+        -- ADDED CHECK: Prevent infinite loops like '4 -> 4'
+        if t == rhsTerm then Nothing else Just rhsTerm
+    constantFolder _ = Nothing
+
+
+
+
     -- Translate everything to Twee.
     toTerm t = tweeTerm flags horn ctx prec t
     toEquation (t, u) = canonicalise (toTerm t :=: toTerm u)
@@ -826,7 +922,12 @@ runTwee globals (TSTPFlags tstp) horn precedence config0 cpConfig flags@MainFlag
 
         pos :: Int -> Float
         pos n = if n <= 0 then 1 else fromIntegral n+1
-    config = config0 { cfg_score_cp = score, cfg_eliminate_axioms = if flags_flatten_regeneralise then defs else [] }
+    config = config0 { 
+      cfg_score_cp = score, 
+      cfg_eliminate_axioms = if flags_flatten_regeneralise then defs else [],
+      cfg_fold_term = Just constantFolder
+      -- cfg_fold_term = Nothing
+    }
 
   let
     withHints = foldl' (addHint config) (initialState config) (map toTerm hints')
