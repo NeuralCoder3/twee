@@ -36,6 +36,8 @@ import qualified Data.Label as Label
 import System.Console.ANSI
 import Data.Symbol
 import Twee.Profile
+import Data.Char (isDigit) -- <<< ADDED
+import Data.Proxy(Proxy(..)) -- <<< ADDED
 
 data MainFlags =
   MainFlags {
@@ -468,6 +470,45 @@ instance EqualsBonus Constant where
   isFalse Skolem{} = False
   isFalse c = SequentialMain.isFalse (con_id c)
 
+-- | This is the concrete implementation of constant folding for 'Constant'.
+instance ConstantFoldable Constant where
+  -- | Parse a 'Term Constant'
+  tryGetConstant (App (F _ (Constant{..})) Nil) =
+     case base con_id of
+       'n':'u':'m':'n':'e':'g':cs | all isDigit cs -> Just (-(read cs))
+       'n':'u':'m':cs | all isDigit cs -> Just (read cs)
+       _ -> Nothing
+  tryGetConstant _ = Nothing
+
+  -- | Get the 'Fun Constant' for a new integer.
+  -- This is defined at the top level, so it CANNOT see 'MainFlags'.
+  -- We build a "default" constant, which may have incorrect KBO
+  -- weights if flags are used, but it's the only way.
+  mkConstantFun _ n =
+    let
+      s = if n >= 0 then "num" ++ show n
+                    else "numneg" ++ show (abs n)
+      jukeboxFun = Jukebox.intern s
+      -- Default precedence, copied from 'runTwee'
+      prec = Precedence False False True Nothing 0
+    in
+      fun (Constant {
+        con_prec = prec,
+        con_id = jukeboxFun,
+        con_arity = 0,
+        con_size = 1,     -- Default size
+        con_weight = 1,   -- Default weight
+        con_bonus = False }) -- Default bonus
+  
+  -- | Get the folding function.
+  tryGetFolder :: Fun Constant -> Maybe ([Integer] -> Term Constant)
+  tryGetFolder (F _ (Constant{..})) =
+    case base con_id of
+      "mul" -> Just (\[x,y] -> build (con (mkConstantFun (Proxy :: Proxy Constant) (x*y))))
+      "add" -> Just (\[x,y] -> build (con (mkConstantFun (Proxy :: Proxy Constant) (x+y))))
+      _     -> Nothing
+  tryGetFolder _ = Nothing
+
 data TweeContext =
   TweeContext {
     ctx_var     :: Jukebox.Variable,
@@ -477,7 +518,7 @@ data TweeContext =
     ctx_equals  :: Jukebox.Function,
     ctx_type    :: Type }
 
--- Convert back and forth between Twee and Jukebox.
+-- | Convert back and forth between Twee and Jukebox.
 tweeConstant :: MainFlags -> HornFlags -> TweeContext -> Precedence -> Jukebox.Function -> Constant
 tweeConstant MainFlags{..} flags TweeContext{..} prec fun
   | fun == ctx_minimal = Minimal
@@ -521,6 +562,8 @@ jukeboxFunction :: TweeContext -> Constant -> Jukebox.Function
 jukeboxFunction _ Constant{..} = con_id
 jukeboxFunction TweeContext{..} Minimal = ctx_minimal
 
+-- | This function is back to its original state.
+-- The smart 'app' constructor will handle the folding.
 tweeTerm :: MainFlags -> HornFlags -> TweeContext -> (Jukebox.Function -> Precedence) -> Jukebox.Term -> Term Constant
 tweeTerm flags horn ctx prec t = build (tm t)
   where

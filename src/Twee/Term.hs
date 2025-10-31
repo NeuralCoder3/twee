@@ -13,7 +13,7 @@
 --   * substitutions ('Substitution', 'Subst', 'subst');
 --   * unification ('unify') and matching ('match');
 --   * miscellaneous useful functions on terms.
-{-# LANGUAGE BangPatterns, PatternSynonyms, ViewPatterns, TypeFamilies, OverloadedStrings, ScopedTypeVariables, CPP, DefaultSignatures #-}
+{-# LANGUAGE BangPatterns, PatternSynonyms, ViewPatterns, TypeFamilies, OverloadedStrings, ScopedTypeVariables, CPP, DefaultSignatures, FlexibleContexts #-}
 {-# OPTIONS_GHC -O2 -fmax-worker-args=100 #-}
 #ifdef USE_LLVM
 {-# OPTIONS_GHC -fllvm #-}
@@ -31,7 +31,7 @@ module Twee.Term(
   Build(..),
   Builder,
   build, buildList,
-  con, app, var,
+  con, app, var, app_,
   -- * Access to subterms
   children, properSubterms, subtermsList, subterms, reverseSubtermsList, reverseSubterms, occurs, isSubtermOf, isSubtermOfList, at, listAt, atPath,
   -- * Substitutions
@@ -80,6 +80,10 @@ import Twee.Utils
 import qualified Data.Label as Label
 import Data.Typeable
 import GHC.Stack
+import Twee.Base (Minimal(..), ConstantFoldable(..)) -- <<< MODIFIED IMPORT
+import Data.Proxy(Proxy(..))
+import Control.Monad (liftM2)
+import Data.Maybe (mapMaybe)
 
 --------------------------------------------------------------------------------
 -- * A type class for builders
@@ -93,6 +97,9 @@ class Build a where
   type BuildFun a
   -- | Convert a value into a 'Builder'.
   builder :: a -> Builder (BuildFun a)
+  -- A default instance for lists which propagates the cache
+  default builder :: (Build a, BuildFun [a] ~ BuildFun a) => a -> Builder (BuildFun [a])
+  builder = mconcat . map builder
 
 instance Build (Builder f) where
   type BuildFun (Builder f) = f
@@ -100,23 +107,32 @@ instance Build (Builder f) where
 
 instance Build (Term f) where
   type BuildFun (Term f) = f
-  builder = emitTermList . singleton
+  builder t = Builder (emitTermList (singleton t)) (Just [t])
 
 instance Build (TermList f) where
   type BuildFun (TermList f) = f
-  builder = emitTermList
+  builder ts = Builder (emitTermList ts) (Just (unpack ts))
 
 instance Build a => Build [a] where
   type BuildFun [a] = BuildFun a
-  {-# INLINE builder #-}
-  builder = mconcat . map builder
+  -- Use the default instance
+  builder = builder
+
+-- | Convert a termlist into an ordinary list of terms.
+unpack :: TermList f -> [Term f]
+unpack t = unfoldr op t
+  where
+    op Nil = Nothing
+    op (Cons t ts) = Just (t, ts)
 
 -- | Build a term. The given builder must produce exactly one term.
 {-# INLINE build #-}
 build :: Build a => a -> Term (BuildFun a)
 build x =
-  case buildList x of
-    Cons t Nil -> t
+  case unpack (buildList x) of
+    [t] -> t
+    []  -> error "build: empty builder"
+    _   -> error "build: multiple terms"
 
 -- | Build a termlist.
 {-# INLINE buildList #-}
@@ -125,17 +141,43 @@ buildList x = buildTermList 16 (builder x)
 
 -- | Build a constant (a function with no arguments).
 {-# INLINE con #-}
-con :: Fun f -> Builder f
-con x = emitApp x mempty
+con :: ConstantFoldable f => Fun f -> Builder f
+con f = app f (mempty :: Builder f) -- 'app' is now smart
 
--- | Build a function application.
+-- | Build a function application (SMART CONSTRUCTOR).
+-- This function performs constant folding if 'ConstantFoldable'
+-- is implemented for 'f'.
 {-# INLINE app #-}
-app :: Build a => Fun (BuildFun a) -> a -> Builder (BuildFun a)
-app f ts = emitApp f (builder ts)
+app :: (ConstantFoldable f, Build a, BuildFun a ~ f) => Fun f -> a -> Builder f
+app f ts =
+  let
+    args = builder ts
+    -- Try to fold
+    tryFold = do
+      -- 1. Check if the function is foldable
+      folder <- tryGetFolder f
+      -- 2. Check if we have the argument cache
+      argTerms <- cache args
+      -- 3. Check if all arguments are constants
+      argVals <- mapM tryGetConstant argTerms
+      -- 4. If so, call the folder
+      let !foldedTerm = folder argVals
+      -- 5. Return a builder for the new term
+      return (builder foldedTerm)
+  in
+    -- If folding failed, build the term normally
+    fromMaybe (app_ f args) tryFold
 
--- | Build a variable.
+-- | The original "dumb" 'app' constructor, which does no folding.
+-- Use this if you know folding is not possible.
+{-# INLINE app_ #-}
+app_ :: Build a => Fun (BuildFun a) -> a -> Builder (BuildFun a)
+app_ f ts = emitApp f (builder ts)
+
+-- | Build a variable (SMART CONSTRUCTOR).
+-- This now returns a cached builder.
 var :: Var -> Builder f
-var = emitVar
+var x = Builder (emitVar x) (Just [build (Builder (emitVar x) Nothing)])
 
 --------------------------------------------------------------------------------
 -- Functions for substitutions.
@@ -164,7 +206,7 @@ allSubst p = foldSubst (\x t y -> p x t && y) True
 -- | Compute the set of variables bound by a substitution.
 {-# INLINE substDomain #-}
 substDomain :: Subst f -> [Var]
-substDomain (Subst sub) = map V (IntMap.keys sub)
+substDomain (Subst sub) = map V (IntMap.keys)
 
 --------------------------------------------------------------------------------
 -- Substitution.
@@ -182,12 +224,12 @@ class Substitution s where
 
   -- | Apply the substitution to a termlist.
   {-# INLINE substList #-}
-  substList :: s -> TermList (SubstFun s) -> Builder (SubstFun s)
+  substList :: (ConstantFoldable (SubstFun s)) => s -> TermList (SubstFun s) -> Builder (SubstFun s)
   substList sub ts = aux ts
     where
       aux Nil = mempty
       aux (Cons (Var x) ts) = evalSubst sub x <> aux ts
-      aux (Cons (App f ts) us) = app f (aux ts) <> aux us
+      aux (Cons (App f ts) us) = app f (aux ts) <> aux us -- <<< Calls smart 'app'
 
 instance (Build a, v ~ Var) => Substitution (v -> a) where
   type SubstFun (v -> a) = BuildFun a
@@ -201,12 +243,12 @@ instance Substitution (Subst f) where
   {-# INLINE evalSubst #-}
   evalSubst sub x =
     case lookupList x sub of
-      Nothing -> var x
-      Just ts -> builder ts
+      Nothing -> var x -- 'var' is now smart and cached
+      Just ts -> builder ts -- 'builder' (for TermList) is now cached
 
 -- | Apply a substitution to a term.
 {-# INLINE subst #-}
-subst :: Substitution s => s -> Term (SubstFun s) -> Builder (SubstFun s)
+subst :: (ConstantFoldable (SubstFun s), Substitution s) => s -> Term (SubstFun s) -> Builder (SubstFun s)
 subst sub t = substList sub (singleton t)
 
 -- | A substitution which maps variables to terms of type @'Term' f@.
@@ -269,7 +311,7 @@ substUnion (Subst !sub1) (Subst !sub2) =
 -- | Check if a substitution is idempotent (applying it twice has the same
 -- effect as applying it once).
 {-# INLINE idempotent #-}
-idempotent :: Subst f -> Bool
+idempotent :: ConstantFoldable f => Subst f -> Bool
 idempotent !sub = allSubst (\_ t -> sub `idempotentOn` t) sub
 
 -- | Check if a substitution has no effect on a given term.
@@ -282,7 +324,7 @@ idempotentOn !sub = aux
     aux (Cons (Var x) t) = isNothing (lookupList x sub) && aux t
 
 -- | Iterate a triangle substitution to make it idempotent.
-close :: TriangleSubst f -> Subst f
+close :: ConstantFoldable f => TriangleSubst f -> Subst f
 close (Triangle sub)
   | idempotent sub = sub
   | otherwise      = close (Triangle (compose sub sub))
@@ -292,7 +334,7 @@ close (Triangle sub)
 
 -- | Return a substitution which renames the variables of a list of terms to put
 -- them in a canonical order.
-canonicalise :: [TermList f] -> Subst f
+canonicalise :: ConstantFoldable f => [TermList f] -> Subst f
 canonicalise [] = emptySubst
 canonicalise (t:ts) = loop emptySubst vars t ts
   where
@@ -323,7 +365,7 @@ emptyTriangleSubst = Triangle emptySubst
 
 -- | Construct a substitution from a list.
 -- Returns @Nothing@ if a variable is bound to several different terms.
-listToSubst :: [(Var, Term f)] -> Maybe (Subst f)
+listToSubst :: ConstantFoldable f => [(Var, Term f)] -> Maybe (Subst f)
 listToSubst sub = matchList pat t
   where
     pat = buildList (map (var . fst) sub)
@@ -369,21 +411,21 @@ matchListIn !sub !pat !t
     in loop sub pat t
 
 -- | A variant of 'match' which works on lists of terms.
-matchMany :: [Term f] -> [Term f] -> Maybe (Subst f)
+matchMany :: ConstantFoldable f => [Term f] -> [Term f] -> Maybe (Subst f)
 matchMany pat t = matchManyIn emptySubst pat t
 
 -- | A variant of 'match' which works on lists of terms,
 -- and extends an existing substitution.
-matchManyIn :: Subst f -> [Term f] -> [Term f] -> Maybe (Subst f)
+matchManyIn :: ConstantFoldable f => Subst f -> [Term f] -> [Term f] -> Maybe (Subst f)
 matchManyIn sub ts us = matchManyListIn sub (map singleton ts) (map singleton us)
 
 -- | A variant of 'match' which works on lists of termlists.
-matchManyList :: [TermList f] -> [TermList f] -> Maybe (Subst f)
+matchManyList :: ConstantFoldable f => [TermList f] -> [TermList f] -> Maybe (Subst f)
 matchManyList pat t = matchManyListIn emptySubst pat t
 
 -- | A variant of 'match' which works on lists of termlists,
 -- and extends an existing substitution.
-matchManyListIn :: Subst f -> [TermList f] -> [TermList f] -> Maybe (Subst f)
+matchManyListIn :: ConstantFoldable f => Subst f -> [TermList f] -> [TermList f] -> Maybe (Subst f)
 matchManyListIn !sub [] [] = return sub
 matchManyListIn sub (t:ts) (u:us) = do
   sub <- matchListIn sub t u
@@ -403,7 +445,7 @@ matchManyListIn _ _ _ = Nothing
 newtype TriangleSubst f = Triangle { unTriangle :: Subst f }
   deriving Show
 
-instance Substitution (TriangleSubst f) where
+instance ConstantFoldable f => Substitution (TriangleSubst f) where
   type SubstFun (TriangleSubst f) = f
 
   {-# INLINE evalSubst #-}
@@ -426,22 +468,22 @@ instance Substitution (TriangleSubst f) where
           Just ts -> aux ts
 
 -- | Unify two terms.
-unify :: Term f -> Term f -> Maybe (Subst f)
+unify :: ConstantFoldable f => Term f -> Term f -> Maybe (Subst f)
 unify t u = unifyList (singleton t) (singleton u)
 
 -- | Unify two termlists.
-unifyList :: TermList f -> TermList f -> Maybe (Subst f)
+unifyList :: ConstantFoldable f => TermList f -> TermList f -> Maybe (Subst f)
 unifyList t u = do
   sub <- unifyListTri t u
   -- Not strict so that isJust (unify t u) doesn't force the substitution
   return (close sub)
 
 -- | Unify a collection of pairs of terms.
-unifyMany :: [(Term f, Term f)] -> Maybe (Subst f)
+unifyMany :: ConstantFoldable f => [(Term f, Term f)] -> Maybe (Subst f)
 unifyMany ts = close <$> unifyManyTri ts
 
 -- | Unify a collection of pairs of terms, returning a triangle substitution.
-unifyManyTri :: [(Term f, Term f)] -> Maybe (TriangleSubst f)
+unifyManyTri :: ConstantFoldable f => [(Term f, Term f)] -> Maybe (TriangleSubst f)
 unifyManyTri ts = loop ts (Triangle emptySubst)
   where
     loop [] sub = Just sub
@@ -451,19 +493,19 @@ unifyManyTri ts = loop ts (Triangle emptySubst)
 
 -- | Unify two terms, returning a triangle substitution.
 -- This is slightly faster than 'unify'.
-unifyTri :: Term f -> Term f -> Maybe (TriangleSubst f)
+unifyTri :: ConstantFoldable f => Term f -> Term f -> Maybe (TriangleSubst f)
 unifyTri t u = unifyListTri (singleton t) (singleton u)
 
 -- | Unify two terms, starting from an existing substitution.
-unifyTriFrom :: Term f -> Term f -> TriangleSubst f -> Maybe (TriangleSubst f)
+unifyTriFrom :: ConstantFoldable f => Term f -> Term f -> TriangleSubst f -> Maybe (TriangleSubst f)
 unifyTriFrom t u sub = unifyListTriFrom (singleton t) (singleton u) sub
 
 -- | Unify two termlists, returning a triangle substitution.
 -- This is slightly faster than 'unify'.
-unifyListTri :: TermList f -> TermList f -> Maybe (TriangleSubst f)
+unifyListTri :: ConstantFoldable f => TermList f -> TermList f -> Maybe (TriangleSubst f)
 unifyListTri t u = unifyListTriFrom t u (Triangle emptySubst)
 
-unifyListTriFrom :: TermList f -> TermList f -> TriangleSubst f -> Maybe (TriangleSubst f)
+unifyListTriFrom :: ConstantFoldable f => TermList f -> TermList f -> TriangleSubst f -> Maybe (TriangleSubst f)
 unifyListTriFrom !t !u (Triangle !sub) =
   fmap Triangle (loop sub t u)
   where
@@ -519,7 +561,7 @@ unifyListTriFrom !t !u (Triangle !sub) =
 -- | The empty termlist.
 {-# NOINLINE empty #-}
 empty :: forall f. TermList f
-empty = buildList (mempty :: Builder f)
+empty = buildTermList 1 (mempty :: Builder f)
 
 -- | Index into a term.
 at :: Term f -> Int -> Term f
@@ -535,12 +577,7 @@ children t =
   case singleton t of
     UnsafeConsSym{urest = ts} -> ts
 
--- | Convert a termlist into an ordinary list of terms.
-unpack :: TermList f -> [Term f]
-unpack t = unfoldr op t
-  where
-    op Nil = Nothing
-    op (Cons t ts) = Just (t, ts)
+-- (unpack is now defined near the top of the file)
 
 instance (Labelled f, Show f) => Show (Term f) where
   show (Var x) = show x
@@ -640,11 +677,11 @@ isVar Var{} = True
 isVar _     = False
 
 -- | @t \`'isInstanceOf'\` pat@ checks if @t@ is an instance of @pat@.
-isInstanceOf :: Term f -> Term f -> Bool
-t `isInstanceOf` pat = isJust (match pat t)
+isInstanceOf :: Term -> Term f -> Bool
+isInstanceOf t pat = isJust (match pat t)
 
 -- | Check if two terms are renamings of one another.
-isVariantOf :: Term f -> Term f -> Bool
+isVariantOf :: ConstantFoldable f => Term f -> Term f -> Bool
 t `isVariantOf` u = t `isInstanceOf` u && u `isInstanceOf` t
 
 -- | Is a term a subterm of another one?
@@ -652,11 +689,11 @@ isSubtermOf :: Term f -> Term f -> Bool
 t `isSubtermOf` u = t `isSubtermOfList` singleton u
 
 -- | Map a function over the function symbols in a term.
-mapFun :: (Fun f -> Fun g) -> Term f -> Builder g
+mapFun :: ConstantFoldable g => (Fun f -> Fun g) -> Term f -> Builder g
 mapFun f = mapFunList f . singleton
 
 -- | Map a function over the function symbols in a termlist.
-mapFunList :: (Fun f -> Fun g) -> TermList f -> Builder g
+mapFunList :: ConstantFoldable g => (Fun f -> Fun g) -> TermList f -> Builder g
 mapFunList f ts = aux ts
   where
     aux Nil = mempty
@@ -664,7 +701,7 @@ mapFunList f ts = aux ts
     aux (Cons (App ff ts) us) = app (f ff) (aux ts) `mappend` aux us
 
 {-# INLINE replace #-}
-replace :: (Build a, BuildFun a ~ f) => Term f -> a -> TermList f -> Builder f
+replace :: (ConstantFoldable f, Build a, BuildFun a ~ f) => Term f -> a -> TermList f -> Builder f
 replace !_ !_ Nil = mempty
 replace t u (Cons v vs)
   | t == v = builder u `mappend` replace t u vs
@@ -676,7 +713,7 @@ replace t u (Cons v vs)
 
 -- | Replace the term at a given position in a term with a different term.
 {-# INLINE replacePosition #-}
-replacePosition :: (Build a, BuildFun a ~ f) => Int -> a -> TermList f -> Builder f
+replacePosition :: (ConstantFoldable f, Build a, BuildFun a ~ f) => Int -> a -> TermList f -> Builder f
 replacePosition n !x = aux n
   where
     aux !_ !_ | never = undefined
@@ -692,7 +729,7 @@ replacePosition n !x = aux n
 -- | Replace the term at a given position in a term with a different term, while
 -- simultaneously applying a substitution. Useful for building critical pairs.
 {-# INLINE replacePositionSub #-}
-replacePositionSub :: (Substitution sub, SubstFun sub ~ f) => sub -> Int -> TermList f -> TermList f -> Builder f
+replacePositionSub :: (ConstantFoldable f, Substitution sub, SubstFun sub ~ f) => sub -> Int -> TermList f -> TermList f -> Builder f
 replacePositionSub sub n !x = aux n
   where
     aux !_ !_ | never = undefined

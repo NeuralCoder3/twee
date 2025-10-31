@@ -1,4 +1,4 @@
--- Terms and substitutions, implemented using flatterms.
+-- | Terms and substitutions, implemented using flatterms.
 -- This module contains all the low-level icky bits
 -- and provides primitives for building higher-level stuff.
 {-# LANGUAGE CPP, PatternSynonyms, ViewPatterns,
@@ -25,6 +25,8 @@ import GHC.Prim
 import GHC.ST hiding (liftST)
 import Data.Ord
 import Twee.Profile
+import Data.List (unfoldr) -- <<< ADDED IMPORT
+import Control.Applicative (liftA2) -- <<< ADDED IMPORT
 
 --------------------------------------------------------------------------------
 -- Symbols. A symbol is a single function or variable in a flatterm.
@@ -255,12 +257,18 @@ compareSameLength t u =
 
 -- | A monoid for building terms.
 -- 'mempty' represents the empty termlist, while 'mappend' appends two termlists.
-newtype Builder f =
+data Builder f =
   Builder {
     unBuilder ::
       -- Takes: the term array, and current position in the term.
       -- Returns the final array and position.
-      forall s. Builder1 s f }
+      forall s. Builder1 s f,
+
+    -- | A "best-effort" cache of the terms in this builder.
+    -- If 'Nothing', the builder is too complex to inspect (e.g., vars).
+    -- Used for constant folding.
+    cache :: !(Maybe [Term f])
+  }
 
 type role Builder nominal
 
@@ -268,17 +276,18 @@ type Builder1 s f = State# s -> MutableByteArray# s -> Int# -> (# State# s, Muta
 
 instance Semigroup (Builder f) where
   {-# INLINE (<>) #-}
-  Builder m1 <> Builder m2 = Builder (m1 `then_` m2)
+  Builder m1 c1 <> Builder m2 c2 =
+    Builder (m1 `then_` m2) (liftA2 (++) c1 c2)
 instance Monoid (Builder f) where
   {-# INLINE mempty #-}
-  mempty = Builder built
+  mempty = Builder built (Just [])
   {-# INLINE mappend #-}
   mappend = (<>)
 
 -- Build a termlist from a Builder.
 {-# INLINE buildTermList #-}
 buildTermList :: Int -> Builder f -> TermList f
-buildTermList initialSize (Builder m) = stamp "build term" $ runST $ do
+buildTermList initialSize (Builder m _) = stamp "build term" $ runST $ do
   MutableByteArray marr# <-
     newByteArray (max 1 initialSize * symbolSize)
   (marr, n) <-
@@ -306,22 +315,25 @@ m1 `then_` m2 = \s arr# n# ->
 -- Emit an arbitrary symbol, with given arguments.
 {-# INLINE emitSymbolBuilder #-}
 emitSymbolBuilder :: Symbol -> Builder f -> Builder f
-emitSymbolBuilder x (Builder inner) =
-  Builder $ \s arr# n# ->
-    let n = I# n# in
-    -- Reserve space for the symbol
-    case reserve s arr# (unInt (n + 1)) of
-      (# s, arr# #) ->
-        -- Fill in the argument list
-        case inner s arr# (unInt (n + 1)) of
-          (# s, arr#, m# #) ->
-            let arr = MutableByteArray arr#
-                m = I# m# in
-            -- Check the length of the argument list in symbols,
-            -- then write the symbol, with the correct size
-            case unST (writeByteArray arr n (fromSymbol x { size = m - n })) s of
-              (# s, () #) ->
-                (# s, arr#, m# #)
+emitSymbolBuilder x (Builder inner _) =
+  Builder (
+    \s arr# n# ->
+      let n = I# n# in
+      -- Reserve space for the symbol
+      case reserve s arr# (unInt (n + 1)) of
+        (# s, arr# #) ->
+          -- Fill in the argument list
+          case inner s arr# (unInt (n + 1)) of
+            (# s, arr#, m# #) ->
+              let arr = MutableByteArray arr#
+                  m = I# m# in
+              -- Check the length of the argument list in symbols,
+              -- then write the symbol, with the correct size
+              case unST (writeByteArray arr n (fromSymbol x { size = m - n })) s of
+                (# s, () #) ->
+                  (# s, arr#, m# #)
+    )
+    Nothing -- Emitting a symbol makes the cache invalid (for now)
 
 -- Emit a function application.
 {-# INLINE emitApp #-}
@@ -331,22 +343,38 @@ emitApp (F n) inner = emitSymbolBuilder (Symbol True n 0) inner
 -- Emit a variable.
 {-# INLINE emitVar #-}
 emitVar :: Var -> Builder f
-emitVar x = emitSymbolBuilder (Symbol False (var_id x) 1) mempty
+-- We set cache to Nothing, as we can't build a 'Term f' here.
+-- The smart 'var' constructor in Twee.Term will provide a cache.
+--
+-- <<< THIS IS THE FIX >>>
+emitVar x = Builder (unBuilder (emitSymbolBuilder (Symbol False (var_id x) 1) mempty)) Nothing
+
+-- | Unpack a 'TermList' into a '[Term f]'.
+-- This is a local copy of 'unpack' from Twee.Term,
+-- to avoid circular dependencies.
+localUnpack :: TermList f -> [Term f]
+localUnpack t = unfoldr op t
+  where
+    op Nil = Nothing
+    op (Cons t ts) = Just (t, ts)
 
 -- Emit a whole termlist.
 {-# INLINE emitTermList #-}
 emitTermList :: TermList f -> Builder f
-emitTermList (TermList lo hi array) =
-  Builder $ \s arr# n# ->
-    let n = I# n# in
-    -- Reserve space for the termlist
-    case reserve s arr# (unInt (n + hi - lo)) of
-      (# s, arr# #) ->
-        let k = symbolSize
-            arr = MutableByteArray arr# in
-        case unST (copyByteArray arr (n*k) array (lo*k) ((hi - lo)*k)) s of
-          (# s, () #) ->
-            (# s, arr#, unInt (n + hi - lo) #)
+emitTermList ts@(TermList lo hi array) =
+  Builder (
+    \s arr# n# ->
+      let n = I# n# in
+      -- Reserve space for the termlist
+      case reserve s arr# (unInt (n + hi - lo)) of
+        (# s, arr# #) ->
+          let k = symbolSize
+              arr = MutableByteArray arr# in
+          case unST (copyByteArray arr (n*k) array (lo*k) ((hi - lo)*k)) s of
+            (# s, () #) ->
+              (# s, arr#, unInt (n + hi - lo) #)
+    )
+    (Just (localUnpack ts)) -- We know the terms, so we cache them
 
 -- Make sure that the term array has enough space to hold the given
 -- number of additional symbols.
