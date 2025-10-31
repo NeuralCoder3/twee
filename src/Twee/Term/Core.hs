@@ -25,8 +25,8 @@ import GHC.Prim
 import GHC.ST hiding (liftST)
 import Data.Ord
 import Twee.Profile
-import Data.List (unfoldr) -- <<< ADDED IMPORT
-import Control.Applicative (liftA2) -- <<< ADDED IMPORT
+import Data.List (unfoldr) -- <<< ADDED
+import Control.Applicative (liftA2) -- <<< ADDED
 
 --------------------------------------------------------------------------------
 -- Symbols. A symbol is a single function or variable in a flatterm.
@@ -346,7 +346,7 @@ emitVar :: Var -> Builder f
 -- We set cache to Nothing, as we can't build a 'Term f' here.
 -- The smart 'var' constructor in Twee.Term will provide a cache.
 --
--- <<< THIS IS THE FIX >>>
+-- <<< THIS IS THE FIX for the 'Couldn't match type' error >>>
 emitVar x = Builder (unBuilder (emitSymbolBuilder (Symbol False (var_id x) 1) mempty)) Nothing
 
 -- | Unpack a 'TermList' into a '[Term f]'.

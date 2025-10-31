@@ -16,13 +16,13 @@ module Twee.Base(
   Ordered(..), lessThan, orientTerms,
   EqualsBonus(..), isTrueTerm, isFalseTerm, decodeEquality,
   Strictness(..), Function,
-  ConstantFoldable(..)) -- <<< MOVED HERE
+  ConstantFoldable(..)) -- <<< EXPORT ADDED
   where
 
 import Prelude hiding (lookup)
 import Control.Monad
 import qualified Data.DList as DList
-import Twee.Term hiding (subst, canonicalise) -- 'subst' is now in Twee.Term
+import Twee.Term hiding (subst, canonicalise)
 import qualified Twee.Term as Term
 import Twee.Utils
 import Twee.Pretty
@@ -57,7 +57,7 @@ class Symbolic a where
   subst_ :: (Var -> BuilderOf a) -> a -> a
 
 -- | Apply a substitution.
-subst :: (ConstantFoldable (ConstantOf a), Symbolic a, Substitution s, SubstFun s ~ ConstantOf a) => s -> a -> a
+subst :: (ConstantFoldable (ConstantOf a), Symbolic a, Substitution s, SubstFun s ~ ConstantOf a) => s -> a -> a -- <<< CONSTRAINT ADDED
 subst sub x = subst_ (Term.evalSubst sub) x
 
 -- | Find all terms occuring in the argument.
@@ -87,30 +87,30 @@ instance Symbolic (TermList f) where
   termsDL = return
   subst_ sub = buildList . Term.substList sub
 
-instance ConstantFoldable f => Symbolic (Subst f) where
+instance ConstantFoldable f => Symbolic (Subst f) where -- <<< CONSTRAINT ADDED
   type ConstantOf (Subst f) = f
   termsDL (Subst sub) = termsDL (IntMap.elems sub)
   subst_ sub (Subst s) = Subst (fmap (subst_ sub) s)
 
-instance (ConstantOf a ~ ConstantOf b, ConstantFoldable (ConstantOf a), Symbolic a, Symbolic b) => Symbolic (a, b) where
+instance (ConstantOf a ~ ConstantOf b, ConstantFoldable (ConstantOf a), Symbolic a, Symbolic b) => Symbolic (a, b) where -- <<< CONSTRAINT ADDED
   type ConstantOf (a, b) = ConstantOf a
   termsDL (x, y) = termsDL x `mplus` termsDL y
   subst_ sub (x, y) = (subst_ sub x, subst_ sub y)
 
 instance (ConstantOf a ~ ConstantOf b,
           ConstantOf a ~ ConstantOf c,
-          ConstantFoldable (ConstantOf a),
+          ConstantFoldable (ConstantOf a), -- <<< CONSTRAINT ADDED
           Symbolic a, Symbolic b, Symbolic c) => Symbolic (a, b, c) where
   type ConstantOf (a, b, c) = ConstantOf a
   termsDL (x, y, z) = termsDL x `mplus` termsDL y `mplus` termsDL z
   subst_ sub (x, y, z) = (subst_ sub x, subst_ sub y, subst_ sub z)
 
-instance ConstantFoldable (ConstantOf a) => Symbolic [a] where
+instance ConstantFoldable (ConstantOf a) => Symbolic [a] where -- <<< CONSTRAINT ADDED
   type ConstantOf [a] = ConstantOf a
   termsDL xs = msum (map termsDL xs)
   subst_ sub xs = map (subst_ sub) xs
 
-instance ConstantFoldable (ConstantOf a) => Symbolic (Maybe a) where
+instance ConstantFoldable (ConstantOf a) => Symbolic (Maybe a) where -- <<< CONSTRAINT ADDED
   type ConstantOf (Maybe a) = ConstantOf a
   termsDL Nothing = mzero
   termsDL (Just x) = termsDL x
@@ -179,7 +179,7 @@ hnest f c as (Cons (App g ts) us) =
 -- | Rename the argument so that variables are introduced in a canonical order
 -- (starting with V0, then V1 and so on).
 {-# INLINEABLE canonicalise #-}
-canonicalise :: (ConstantFoldable (ConstantOf a), Symbolic a) => a -> a
+canonicalise :: (ConstantFoldable (ConstantOf a), Symbolic a) => a -> a -- <<< CONSTRAINT ADDED
 canonicalise t = subst sub t
   where
     sub = Term.canonicalise (DList.toList (termsDL t))
@@ -187,7 +187,7 @@ canonicalise t = subst sub t
 -- | Rename the second argument so that it does not mention any variable which
 -- occurs in the first.
 {-# INLINEABLE renameAvoiding #-}
-renameAvoiding :: (ConstantFoldable (ConstantOf a), ConstantFoldable (ConstantOf b), Symbolic a, Symbolic b) => a -> b -> b
+renameAvoiding :: (ConstantFoldable (ConstantOf a), ConstantFoldable (ConstantOf b), Symbolic a, Symbolic b) => a -> b -> b -- <<< CONSTRAINTS ADDED
 renameAvoiding x y
   | x2 < y1 || y2 < x1 =
     -- No overlap. Important in the case when x is ground,
@@ -209,7 +209,7 @@ freshVar x
     (V x1, V x2) = boundLists (terms x)
 
 {-# INLINEABLE renameManyAvoiding #-}
-renameManyAvoiding :: (ConstantFoldable (ConstantOf a), Symbolic a) => [a] -> [a]
+renameManyAvoiding :: (ConstantFoldable (ConstantOf a), Symbolic a) => [a] -> [a] -- <<< CONSTRAINT ADDED
 renameManyAvoiding [] = []
 renameManyAvoiding (t:ts) = u:us
   where
@@ -227,7 +227,7 @@ minimalTerm = build (con minimal)
 
 -- | Erase a given set of variables from the argument, replacing them with the
 -- minimal constant.
-erase :: (Symbolic a, ConstantOf a ~ f, Minimal f, ConstantFoldable f) => [Var] -> a -> a
+erase :: (Symbolic a, ConstantOf a ~ f, Minimal f, ConstantFoldable f) => [Var] -> a -> a -- <<< CONSTRAINT ADDED
 erase [] t = t
 erase xs t = subst sub t
   where
@@ -235,22 +235,22 @@ erase xs t = subst sub t
 
 -- | Erase all except a given set of variables from the argument, replacing them
 -- with the minimal constant.
-eraseExcept :: (Symbolic a, ConstantOf a ~ f, Minimal f, ConstantFoldable f) => [Var] -> a -> a
+eraseExcept :: (Symbolic a, ConstantOf a ~ f, Minimal f, ConstantFoldable f) => [Var] -> a -> a -- <<< CONSTRAINT ADDED
 eraseExcept xs t =
   erase (usort (vars t) \\ xs) t
 
 -- | Replace all variables in the argument with the minimal constant.
-ground :: (Symbolic a, ConstantOf a ~ f, Minimal f, ConstantFoldable f) => a -> a
+ground :: (Symbolic a, ConstantOf a ~ f, Minimal f, ConstantFoldable f) => a -> a -- <<< CONSTRAINT ADDED
 ground t = erase (vars t) t
 
 -- | Skolemise the argument.
-skolemise :: (Symbolic a, ConstantOf a ~ f, Minimal f, ConstantFoldable f) => a -> a
+skolemise :: (Symbolic a, ConstantOf a ~ f, Minimal f, ConstantFoldable f) => a -> a -- <<< CONSTRAINT ADDED
 skolemise t = subst (\(V x) -> con (skolem x)) t
 
 -- | For types which have a notion of size.
 -- | The collection of constraints which the type of function symbols must
 -- satisfy in order to be used by twee.
-type Function f = (Ordered f, Minimal f, PrettyTerm f, EqualsBonus f, Labelled f, ConstantFoldable f) -- <<< ADDED ConstantFoldable
+type Function f = (Ordered f, Minimal f, PrettyTerm f, EqualsBonus f, Labelled f, ConstantFoldable f) -- <<< CONSTRAINT ADDED
 
 -- | A hack for encoding Horn clauses. See 'Twee.CP.Score'.
 -- The default implementation of 'hasEqualsBonus' should work OK.
@@ -307,3 +307,5 @@ instance (Labelled f, Minimal f) => ConstantFoldable f where
   tryGetConstant _ = Nothing
   mkConstantFun _ _ = minimal
   tryGetFolder _ = Nothing
+
+}

@@ -13,7 +13,7 @@
 --   * substitutions ('Substitution', 'Subst', 'subst');
 --   * unification ('unify') and matching ('match');
 --   * miscellaneous useful functions on terms.
-{-# LANGUAGE BangPatterns, PatternSynonyms, ViewPatterns, TypeFamilies, OverloadedStrings, ScopedTypeVariables, CPP, DefaultSignatures, FlexibleContexts #-}
+{-# LANGUAGE BangPatterns, PatternSynonyms, ViewPatterns, TypeFamilies, OverloadedStrings, ScopedTypeVariables, CPP, DefaultSignatures, FlexibleContexts #-} -- <<< ADDED FlexibleContexts
 {-# OPTIONS_GHC -O2 -fmax-worker-args=100 #-}
 #ifdef USE_LLVM
 {-# OPTIONS_GHC -fllvm #-}
@@ -80,10 +80,10 @@ import Twee.Utils
 import qualified Data.Label as Label
 import Data.Typeable
 import GHC.Stack
-import Twee.Base (Minimal(..), ConstantFoldable(..)) -- <<< MODIFIED IMPORT
-import Data.Proxy(Proxy(..))
-import Control.Monad (liftM2)
-import Data.Maybe (mapMaybe)
+import Twee.Base (Minimal(..), ConstantFoldable(..)) -- <<< IMPORT ADDED
+import Data.Proxy(Proxy(..)) -- <<< ADDED
+import Control.Monad (liftM2) -- <<< ADDED
+import Data.Maybe (mapMaybe) -- <<< ADDED
 
 --------------------------------------------------------------------------------
 -- * A type class for builders
@@ -206,7 +206,7 @@ allSubst p = foldSubst (\x t y -> p x t && y) True
 -- | Compute the set of variables bound by a substitution.
 {-# INLINE substDomain #-}
 substDomain :: Subst f -> [Var]
-substDomain (Subst sub) = map V (IntMap.keys)
+substDomain (Subst sub) = map V (IntMap.keys sub)
 
 --------------------------------------------------------------------------------
 -- Substitution.
@@ -677,8 +677,8 @@ isVar Var{} = True
 isVar _     = False
 
 -- | @t \`'isInstanceOf'\` pat@ checks if @t@ is an instance of @pat@.
-isInstanceOf :: Term -> Term f -> Bool
-isInstanceOf t pat = isJust (match pat t)
+isInstanceOf :: Term f -> Term f -> Bool
+t `isInstanceOf` pat = isJust (match pat t)
 
 -- | Check if two terms are renamings of one another.
 isVariantOf :: ConstantFoldable f => Term f -> Term f -> Bool
