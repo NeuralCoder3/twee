@@ -934,6 +934,11 @@ runTwee globals (TSTPFlags tstp) horn precedence config0 cpConfig flags@MainFlag
               -- ### ADD UNARY OPERATORS HERE ###
               "is_not_zero" -> Just (if val1 /= 0 then buildConstant 1 else buildConstant 0)
               "neg" -> Just (buildConstant (negate val1))
+              "abs" -> Just (buildConstant (abs val1))
+              "is_const_pos" -> Just (if val1 > 0 then buildConstant 1 else buildConstant 0)
+              "is_const_neg" -> Just (if val1 < 0 then buildConstant 1 else buildConstant 0)
+              "not" -> Just (if val1 /= 0 then buildConstant 0 else buildConstant 1)
+
               -- "const_is_not_zero" -> Just (if val1 /= 0 then buildWrappedConstant 1 else buildWrappedConstant 0)
               _     -> Nothing
 
@@ -956,7 +961,6 @@ runTwee globals (TSTPFlags tstp) horn precedence config0 cpConfig flags@MainFlag
           rhsTerm <-
             case opName of
               -- ### ADD BINARY OPERATORS HERE ###
-              "mul" -> Just (buildConstant (val1 * val2))
               -- "div" | val2 /= 0 -> Just (buildConstant (val1 `div` val2))
               "div" | val2 /= 0 -> Just (buildConstant (val1 `quot` val2))
                     | otherwise -> Nothing -- Don't fold division by zero
@@ -972,13 +976,26 @@ runTwee globals (TSTPFlags tstp) horn precedence config0 cpConfig flags@MainFlag
               -- "mod" | val2 /= 0 -> Just (buildConstant (val1 `mod` val2))
               "mod" | val2 /= 0 -> Just (buildConstant (val1 `rem` val2))
                     | otherwise -> Nothing -- Don't fold division by zero
-              "const_mul" -> 
-                unsafePerformIO $ do
-                  putStrLn ("Folding const_mul with values: " ++ show val1 ++ ", " ++ show val2) 
-                  return $ Just (buildWrappedConstant (val1 * val2))
+              -- "const_mul" -> 
+              --   unsafePerformIO $ do
+              --     putStrLn ("Folding const_mul with values: " ++ show val1 ++ ", " ++ show val2) 
+              --     return $ Just (buildWrappedConstant (val1 * val2))
                   -- return $ Just (buildConstant (val1 * val2))
               -- "const_div" | val2 /= 0 -> Just (buildWrappedConstant (val1 `quot` val2))
               --            | otherwise -> Nothing -- Don't fold division by zero
+              "mul" -> Just (buildConstant (val1 * val2))
+              "add" -> Just (buildConstant (val1 + val2))
+              "sub" -> Just (buildConstant (val1 - val2))
+              "lt"  -> Just (if val1 < val2 then buildConstant 1 else buildConstant 0)
+              "le"  -> Just (if val1 <= val2 then buildConstant 1 else buildConstant 0)
+              "gt"  -> Just (if val1 > val2 then buildConstant 1 else buildConstant 0)
+              "ge"  -> Just (if val1 >= val2 then buildConstant 1 else buildConstant 0)
+              "eq"  -> Just (if val1 == val2 then buildConstant 1 else buildConstant 0)
+              "ne" -> Just (if val1 /= val2 then buildConstant 1 else buildConstant 0)
+              "and" -> Just (if (val1 /= 0) && (val2 /= 0) then buildConstant 1 else buildConstant 0)
+              "or"  -> Just (if (val1 /= 0) || (val2 /= 0) then buildConstant 1 else buildConstant 0)
+              "min" -> Just (buildConstant (min val1 val2))
+              "max" -> Just (buildConstant (max val1 val2))
               _     -> Nothing
           
           -- Prevent infinite loop
