@@ -3,6 +3,7 @@
 module SequentialMain(main) where
 
 import System.IO.Unsafe (unsafePerformIO)
+import Data.IORef
 import Control.Monad
 import Data.Char
 import Data.Either
@@ -495,6 +496,12 @@ tweeConstant MainFlags{..} flags TweeContext{..} prec fun
       con_arity = Jukebox.arity fun,
       con_size = if flags_kbo_weight0 && Jukebox.arity fun >= 2 then 0 else if flags_kbo_weight0_unary && isInv then 0 else 1,
       con_weight = 1,
+      -- con_weight = 
+      --   let s = base (name fun) in
+      --     -- if "const_" `isPrefixOf` s then 1 else 2,
+      --     -- if "const_" `isPrefixOf` s then 2 else 1,
+      --     if "num" `isPrefixOf` s then 1 else 2,
+      --     -- if "const_" `isPrefixOf` s then 0 else 1,
       con_bonus = bonus fun }
   where
     bonus fun =
@@ -793,7 +800,7 @@ runTwee globals (TSTPFlags tstp) horn precedence config0 cpConfig flags@MainFlag
     getConstName _ = Nothing
 
     maxNumConst :: Integer
-    maxNumConst = 100
+    maxNumConst = 10000
     
     -- | Parses a 'num' or 'numneg' constant string into an Integer
     parseConstVal :: Constant -> Maybe Integer
@@ -913,6 +920,10 @@ runTwee globals (TSTPFlags tstp) horn precedence config0 cpConfig flags@MainFlag
     --     -- Create the Twee 'Constant' value using the existing function
     --     newConst = tweeConstant flags horn ctx (prec newJubFun) newJubFun
 
+    -- a global set to keep track of created constants (String, List of Integers)
+    createdConstants :: IORef (Set.Set (String, [Integer]))
+    createdConstants = unsafePerformIO $ newIORef Set.empty
+
     -- | The main constant folding function to be passed to Twee.
     -- | The main constant folding function to be passed to Twee.
     constantFolder :: Term Constant -> Maybe (Term Constant)
@@ -930,17 +941,32 @@ runTwee globals (TSTPFlags tstp) horn precedence config0 cpConfig flags@MainFlag
 
           -- Evaluate result
           rhsTerm <-
-            case opName of
-              -- ### ADD UNARY OPERATORS HERE ###
-              "is_not_zero" -> Just (if val1 /= 0 then buildConstant 1 else buildConstant 0)
-              "neg" -> Just (buildConstant (negate val1))
-              "abs" -> Just (buildConstant (abs val1))
-              "is_const_pos" -> Just (if val1 > 0 then buildConstant 1 else buildConstant 0)
-              "is_const_neg" -> Just (if val1 < 0 then buildConstant 1 else buildConstant 0)
-              "not" -> Just (if val1 /= 0 then buildConstant 0 else buildConstant 1)
+            if (unsafePerformIO $ do
+                  seen <- readIORef createdConstants
+                  -- putStrLn ("Checking for infinite loop with operator: " ++ opName ++ " and value: " ++ show val1)
+                  let key = (opName, [val1])
+                  if Set.member key seen
+                    then return True
+                    else do
+                      writeIORef createdConstants (Set.insert key seen)
+                      return False)
+            then Nothing -- Prevent infinite loop for already seen constants
+            else 
+              case opName of
+                -- ### ADD UNARY OPERATORS HERE ###
+                "is_not_zero" -> Just (if val1 /= 0 then buildConstant 1 else buildConstant 0)
+                "neg" -> Just (buildConstant (negate val1))
+                "abs" -> Just (buildConstant (abs val1))
+                "is_const_pos" -> Just (if val1 > 0 then buildConstant 1 else buildConstant 0)
+                "is_const_neg" -> Just (if val1 < 0 then buildConstant 1 else buildConstant 0)
+                "not" -> Just (if val1 /= 0 then buildConstant 0 else buildConstant 1)
 
-              -- "const_is_not_zero" -> Just (if val1 /= 0 then buildWrappedConstant 1 else buildWrappedConstant 0)
-              _     -> Nothing
+                "const_is_not_zero" -> Just (if val1 /= 0 then buildWrappedConstant 1 else buildWrappedConstant 0)
+                -- "const_is_not_zero" -> 
+                --     unsafePerformIO $ do
+                --     putStrLn ("Folding const_is_not_zero with value: " ++ show val1)
+                --     return $ Just (if val1 /= 0 then buildWrappedConstant 1 else buildWrappedConstant 0)
+                _     -> Nothing
 
           -- Prevent infinite loop (e.g., 4 -> 4)
           if t == rhsTerm then Nothing else Just rhsTerm
@@ -959,44 +985,60 @@ runTwee globals (TSTPFlags tstp) horn precedence config0 cpConfig flags@MainFlag
 
           -- Evaluate result
           rhsTerm <-
-            case opName of
-              -- ### ADD BINARY OPERATORS HERE ###
-              -- "div" | val2 /= 0 -> Just (buildConstant (val1 `div` val2))
-              "div" | val2 /= 0 -> Just (buildConstant (val1 `quot` val2))
-                    | otherwise -> Nothing -- Don't fold division by zero
-              -- "div" | val2 /= 0 -> if val1 >= 0 && val2 > 0 then Just (buildConstant (val1 `div` val2))
-              --                       else Nothing
-              -- "div" | val2 /= 0 -> Just (buildConstant (
-              --     if val1 >= 0 && val2 > 0 then val1 `div` val2
-              --       else if val1 < 0 && val2 < 0 then ((-val1) `div` (-val2))
-              --       else if val1 < 0 && val2 > 0 then ((-val1) `div` val2) * (-1)
-              --       else (val1 `div` (-val2)) * (-1)
-              --     ))
-              --       | otherwise -> Nothing -- Don't fold division by zero
-              -- "mod" | val2 /= 0 -> Just (buildConstant (val1 `mod` val2))
-              "mod" | val2 /= 0 -> Just (buildConstant (val1 `rem` val2))
-                    | otherwise -> Nothing -- Don't fold division by zero
-              -- "const_mul" -> 
-              --   unsafePerformIO $ do
-              --     putStrLn ("Folding const_mul with values: " ++ show val1 ++ ", " ++ show val2) 
-              --     return $ Just (buildWrappedConstant (val1 * val2))
-                  -- return $ Just (buildConstant (val1 * val2))
-              -- "const_div" | val2 /= 0 -> Just (buildWrappedConstant (val1 `quot` val2))
-              --            | otherwise -> Nothing -- Don't fold division by zero
-              "mul" -> Just (buildConstant (val1 * val2))
-              "add" -> Just (buildConstant (val1 + val2))
-              "sub" -> Just (buildConstant (val1 - val2))
-              "lt"  -> Just (if val1 < val2 then buildConstant 1 else buildConstant 0)
-              "le"  -> Just (if val1 <= val2 then buildConstant 1 else buildConstant 0)
-              "gt"  -> Just (if val1 > val2 then buildConstant 1 else buildConstant 0)
-              "ge"  -> Just (if val1 >= val2 then buildConstant 1 else buildConstant 0)
-              "eq"  -> Just (if val1 == val2 then buildConstant 1 else buildConstant 0)
-              "ne" -> Just (if val1 /= val2 then buildConstant 1 else buildConstant 0)
-              "and" -> Just (if (val1 /= 0) && (val2 /= 0) then buildConstant 1 else buildConstant 0)
-              "or"  -> Just (if (val1 /= 0) || (val2 /= 0) then buildConstant 1 else buildConstant 0)
-              "min" -> Just (buildConstant (min val1 val2))
-              "max" -> Just (buildConstant (max val1 val2))
-              _     -> Nothing
+            if (unsafePerformIO $ do
+                  seen <- readIORef createdConstants
+                  -- putStrLn ("Checking for infinite loop with operator: " ++ opName ++ " and value: " ++ show val1)
+                  let key = (opName, [val1])
+                  if Set.member key seen
+                    then return True
+                    else do
+                      writeIORef createdConstants (Set.insert key seen)
+                      return False)
+            then Nothing -- Prevent infinite loop for already seen constants
+            else 
+              case opName of
+                -- ### ADD BINARY OPERATORS HERE ###
+                -- "div" | val2 /= 0 -> Just (buildConstant (val1 `div` val2))
+                "div" | val2 /= 0 -> Just (buildConstant (val1 `quot` val2))
+                      | otherwise -> Nothing -- Don't fold division by zero
+                -- "div" | val2 /= 0 -> if val1 >= 0 && val2 > 0 then Just (buildConstant (val1 `div` val2))
+                --                       else Nothing
+                -- "div" | val2 /= 0 -> Just (buildConstant (
+                --     if val1 >= 0 && val2 > 0 then val1 `div` val2
+                --       else if val1 < 0 && val2 < 0 then ((-val1) `div` (-val2))
+                --       else if val1 < 0 && val2 > 0 then ((-val1) `div` val2) * (-1)
+                --       else (val1 `div` (-val2)) * (-1)
+                --     ))
+                --       | otherwise -> Nothing -- Don't fold division by zero
+                -- "mod" | val2 /= 0 -> Just (buildConstant (val1 `mod` val2))
+                "mod" | val2 /= 0 -> Just (buildConstant (val1 `rem` val2))
+                      | otherwise -> Nothing -- Don't fold division by zero
+                -- "const_mul" -> 
+                --   unsafePerformIO $ do
+                --     putStrLn ("Folding const_mul with values: " ++ show val1 ++ ", " ++ show val2) 
+                --     return $ Just (buildWrappedConstant (val1 * val2))
+                    -- return $ Just (buildConstant (val1 * val2))
+                -- "const_div" | val2 /= 0 -> Just (buildWrappedConstant (val1 `quot` val2))
+                --            | otherwise -> Nothing -- Don't fold division by zero
+                "mul" -> Just (buildConstant (val1 * val2))
+                "add" -> Just (buildConstant (val1 + val2))
+                "sub" -> Just (buildConstant (val1 - val2))
+                "lt"  -> Just (if val1 < val2 then buildConstant 1 else buildConstant 0)
+                "le"  -> Just (if val1 <= val2 then buildConstant 1 else buildConstant 0)
+                "gt"  -> Just (if val1 > val2 then buildConstant 1 else buildConstant 0)
+                "ge"  -> Just (if val1 >= val2 then buildConstant 1 else buildConstant 0)
+                "eq"  -> Just (if val1 == val2 then buildConstant 1 else buildConstant 0)
+                "ne" -> Just (if val1 /= val2 then buildConstant 1 else buildConstant 0)
+                "and" -> Just (if (val1 /= 0) && (val2 /= 0) then buildConstant 1 else buildConstant 0)
+                "or"  -> Just (if (val1 /= 0) || (val2 /= 0) then buildConstant 1 else buildConstant 0)
+                "min" -> Just (buildConstant (min val1 val2))
+                "max" -> Just (buildConstant (max val1 val2))
+                "const_mul" -> Just (buildWrappedConstant (val1 * val2))
+                "const_div" | val2 /= 0 -> Just (buildWrappedConstant (val1 `quot` val2))
+                           | otherwise -> Nothing -- Don't fold division by zero
+                "const_mod" | val2 /= 0 -> Just (buildWrappedConstant (val1 `rem` val2))
+                           | otherwise -> Nothing -- Don't fold division by zero
+                _     -> Nothing
           
           -- Prevent infinite loop
           if t == rhsTerm then Nothing else Just rhsTerm

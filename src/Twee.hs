@@ -533,7 +533,11 @@ addActive config@Config{..} state@State{..} active0 =
           let
             -- This is the equation for the rule we are *currently* adding
             --
-            current_eqn = canonicalise (unorient active_rule)
+            current_eqn = 
+              canonicalise (unorient active_rule)
+              -- unsafePerformIO $ do
+              --   putStrLn $ "Current rule being added: " ++ prettyShow (lhs active_rule) ++ " :=: " ++ prettyShow (rhs active_rule)
+              --   return (canonicalise (unorient active_rule))
 
             all_subterms = usort (subterms (lhs active_rule) ++ subterms (rhs active_rule))
             
